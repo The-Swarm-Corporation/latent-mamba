@@ -218,3 +218,35 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# --------------------------------------------------------------------------- #
+# Latent Mamba: OS, editors, and ML training artifacts
+# --------------------------------------------------------------------------- #
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Model checkpoints and weights
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+checkpoints/
+
+# Experiment tracking and run outputs
+wandb/
+runs/
+lightning_logs/
+outputs/
+mlruns/

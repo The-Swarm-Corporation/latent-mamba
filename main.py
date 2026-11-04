@@ -1,5 +1,5 @@
 """
-latent_mamba.py: adaptive continuous ("latent") reasoning on a Mamba-2 backbone.
+main.py: adaptive continuous ("latent") reasoning on a Mamba-2 backbone.
 
 Overview
 --------
