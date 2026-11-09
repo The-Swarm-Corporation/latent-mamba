@@ -749,6 +749,29 @@ def _check_fused(device: torch.device) -> None:
     print("fused scan matches the reference (outputs and gradients)")
 
 
+def enable_grad_checkpointing(bundle: Bundle) -> None:
+    """Recompute each Mamba layer in the backward pass instead of storing its activations.
+
+    Activation memory drops to one (B, L, d_model) tensor per layer, at the
+    cost of about one extra forward pass. GPT-2 is left alone: Hugging Face's
+    checkpointing turns off the KV cache that Coconut's thought loop needs.
+    """
+    if bundle.kind != "mamba":
+        print("note: --grad-checkpoint only applies to Mamba models; ignored")
+        return
+    from torch.utils.checkpoint import checkpoint
+
+    for layer in bundle.model.backbone.layers:
+        forward = layer.forward
+
+        def wrapped(x: Tensor, state: Any = None, mask: Tensor | None = None, _forward: Any = forward) -> Any:
+            if torch.is_grad_enabled():
+                return checkpoint(_forward, x, state, mask, use_reentrant=False)
+            return _forward(x, state, mask)
+
+        layer.forward = wrapped
+
+
 def install_scan(fused: bool, device: torch.device) -> None:
     lm.ssd_step = _step_fp32
     lm.ssd_chunked_scan = _scan_fp32
@@ -1298,6 +1321,8 @@ def train_cmd(args: argparse.Namespace) -> None:
         if d.is_main:
             print(f"resuming {out}: finished phases {', '.join(progress['completed'])}")
     model = bundle.model.to(d.device)
+    if args.grad_checkpoint:
+        enable_grad_checkpointing(bundle)
     broadcast_params(model, d)
     params = list(model.parameters())
 
@@ -2074,6 +2099,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="use mamba_ssm's Triton scan for prompts and answers",
     )
+    g.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=True,
+                   help="recompute Mamba layers in the backward pass to save memory")
     g.add_argument("--max-train-examples", type=int)
     g.add_argument("--max-val-examples", type=int)
     g.add_argument(

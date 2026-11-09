@@ -406,8 +406,9 @@ def ssd_chunked_scan(
 
     xs = x * dt.unsqueeze(-1)
     a_dt = dt * a
-    bs = b.unsqueeze(2).expand(bsz, seqlen, n_heads, d_state)
-    cs = c.unsqueeze(2).expand(bsz, seqlen, n_heads, d_state)
+    # B and C are shared by every head (a single group), so they are never
+    # expanded per head: that would multiply their memory by n_heads.
+    bs, cs = b, c
 
     chunk = min(chunk_size, seqlen)
     pad = (-seqlen) % chunk
@@ -415,25 +416,25 @@ def ssd_chunked_scan(
         # Zero padding at the end is exact: A=0 means no decay and X=0 means no input.
         xs = F.pad(xs, (0, 0, 0, 0, 0, pad))
         a_dt = F.pad(a_dt, (0, 0, 0, pad))
-        bs = F.pad(bs, (0, 0, 0, 0, 0, pad))
-        cs = F.pad(cs, (0, 0, 0, 0, 0, pad))
+        bs = F.pad(bs, (0, 0, 0, pad))
+        cs = F.pad(cs, (0, 0, 0, pad))
     n_chunks = (seqlen + pad) // chunk
 
     xs = xs.reshape(bsz, n_chunks, chunk, n_heads, headdim)
-    bs = bs.reshape(bsz, n_chunks, chunk, n_heads, d_state)
-    cs = cs.reshape(bsz, n_chunks, chunk, n_heads, d_state)
-    a_dt = a_dt.reshape(bsz, n_chunks, chunk, n_heads).permute(
-        0, 3, 1, 2
-    )  # (b, h, c, l)
+    bs = bs.reshape(bsz, n_chunks, chunk, d_state)
+    cs = cs.reshape(bsz, n_chunks, chunk, d_state)
+    a_dt = a_dt.reshape(bsz, n_chunks, chunk, n_heads).permute(0, 3, 1, 2)  # (b, h, c, l)
     a_cumsum = torch.cumsum(a_dt, dim=-1)
 
-    # 1. Intra-chunk outputs (diagonal blocks).
-    decay = torch.exp(_segsum(a_dt))
-    y_diag = torch.einsum("bclhn,bcshn,bhcls,bcshp->bclhp", cs, bs, decay, xs)
+    # 1. Intra-chunk outputs (diagonal blocks): (c_l . b_s) * decay(l <- s) * x_s.
+    scores = torch.einsum("bcln,bcsn->bcls", cs, bs)
+    weights = torch.exp(_segsum(a_dt)) * scores.unsqueeze(1)  # (b, h, c, l, s)
+    y_diag = torch.einsum("bhcls,bcshp->bclhp", weights, xs)
 
     # 2. State contributed by each chunk, measured at its end.
-    decay_states = torch.exp(a_cumsum[..., -1:] - a_cumsum)
-    states = torch.einsum("bclhn,bhcl,bclhp->bchpn", bs, decay_states, xs)
+    decay_states = torch.exp(a_cumsum[..., -1:] - a_cumsum)  # (b, h, c, l)
+    xs_decayed = xs * decay_states.permute(0, 2, 3, 1).unsqueeze(-1)  # (b, c, l, h, p)
+    states = torch.einsum("bcln,bclhp->bchpn", bs, xs_decayed)
 
     # 3. Inter-chunk recurrence: states at every chunk boundary.
     states = torch.cat([initial_state.unsqueeze(1), states], dim=1)
@@ -442,7 +443,8 @@ def ssd_chunked_scan(
     states, final_state = new_states[:, :-1], new_states[:, -1]
 
     # 4. Contribution of the carried-in state to each position.
-    y_off = torch.einsum("bclhn,bchpn,bhcl->bclhp", cs, states, torch.exp(a_cumsum))
+    y_off = torch.einsum("bcln,bchpn->bclhp", cs, states)
+    y_off = y_off * torch.exp(a_cumsum).permute(0, 2, 3, 1).unsqueeze(-1)
 
     y = (y_diag + y_off).reshape(bsz, n_chunks * chunk, n_heads, headdim)[:, :seqlen]
     return y, final_state
