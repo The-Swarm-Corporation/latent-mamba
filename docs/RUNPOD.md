@@ -103,7 +103,7 @@ Useful `TRAIN_ARGS`:
 - `--wandb-checkpoints`: also stores checkpoints as W&B artifacts
 - `--max-tokens N`: drops overly long training examples
 
-**ProntoQA** has to be generated first with the official generator (`python train.py data --dataset prontoqa` prints the commands). Put the output in `/workspace/data/` by running `python train.py data --dataset prontoqa --prontoqa-raw 5hop_0shot_random.json --data-dir /workspace/data`.
+**ProntoQA** has to be generated first with the official generator (`python latent_mamba/train.py data --dataset prontoqa` prints the commands). Put the output in `/workspace/data/` by running `python latent_mamba/train.py data --dataset prontoqa --prontoqa-raw 5hop_0shot_random.json --data-dir /workspace/data`.
 
 ## Where results go
 
@@ -121,9 +121,10 @@ To load a checkpoint anywhere:
 
 ```python
 from huggingface_hub import hf_hub_download
+import sys; sys.path.insert(0, "latent_mamba")
 from train import load_checkpoint
 
 bundle, meta = load_checkpoint(hf_hub_download("kye/latent-mamba", "gsm8k-mamba2-130m-latent/ponder.pt"))
 ```
 
-To upload something by hand (for example after an interrupted upload): `python train.py upload --path /workspace/runs/<run> --hf-repo kye/latent-mamba`.
+To upload something by hand (for example after an interrupted upload): `python latent_mamba/train.py upload --path /workspace/runs/<run> --hf-repo kye/latent-mamba`.

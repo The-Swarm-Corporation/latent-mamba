@@ -4,7 +4,7 @@ These are the design notes behind Latent Mamba, from the original Claude convers
 
 **[Claude conversation and architecture diagram](https://claude.ai/chat/a327398f-fd14-42ac-928a-e84e1de7229e?artifact=6098850e-24e4-4ba1-80aa-fee723e678e0)**
 
-> **Note:** the implementation described at the end of these notes, originally `latent_mamba.py`, is now [`main.py`](main.py). It has no `--selftest` or `--demo` flags. `python main.py` runs `self_test()` and then `run_demo()`, and you can also import and call either one directly. The PyTorch self-test has since been run and passes. See the [README](README.md) for usage.
+> **Note:** the implementation described at the end of these notes, originally `latent_mamba.py`, is now [`latent_mamba/main.py`](../latent_mamba/main.py). It has no `--selftest` or `--demo` flags. `python latent_mamba/main.py` runs `self_test()` and then `run_demo()`, and you can also import and call either one directly. The PyTorch self-test has since been run and passes. See the [README](../README.md) for usage.
 
 ---
 

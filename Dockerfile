@@ -4,7 +4,7 @@
 #   docker push <dockerhub-user>/latent-mamba:0.1
 #
 # The container runs scripts/run_pipeline.sh, configured through environment
-# variables (MODEL, DATASET, HF_TOKEN, WANDB_API_KEY, ...). See RUNPOD.md.
+# variables (MODEL, DATASET, HF_TOKEN, WANDB_API_KEY, ...). See docs/RUNPOD.md.
 #
 # Build with --build-arg INSTALL_MAMBA_SSM=1 to compile mamba_ssm's fused scan
 # kernels (adds ~20 min to the build). Then add --fused-scan to TRAIN_ARGS.
@@ -30,7 +30,7 @@ RUN if [ "$INSTALL_MAMBA_SSM" = "1" ]; then \
         pip install packaging ninja && pip install --no-build-isolation mamba-ssm; \
     fi
 
-COPY main.py train.py ./
+COPY latent_mamba/ latent_mamba/
 COPY scripts/ scripts/
 
 CMD ["bash", "scripts/run_pipeline.sh"]

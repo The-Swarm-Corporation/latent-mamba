@@ -1,6 +1,15 @@
 ## Latent Mamba
 
-Implementation of <a href="paper.pdf">Latent Mamba</a>, adaptive continuous reasoning in constant memory, in Pytorch
+Implementation of <a href="docs/paper.pdf">Latent Mamba</a>, adaptive continuous reasoning in constant memory, in Pytorch
+
+| | |
+|---|---|
+| Paper | [docs/paper.pdf](docs/paper.pdf) · LaTeX source [docs/latent_mamba.tex](docs/latent_mamba.tex) |
+| Model | [latent_mamba/main.py](latent_mamba/main.py) |
+| Training & evaluation | [latent_mamba/train.py](latent_mamba/train.py) · [scripts/run_pipeline.sh](scripts/run_pipeline.sh) · [Dockerfile](Dockerfile) |
+| Guides | [docs/RUNPOD.md](docs/RUNPOD.md) (GPUs, RunPod) · [docs/architecture.md](docs/architecture.md) (design notes) |
+| Checkpoints | [huggingface.co/kye/latent-mamba](https://huggingface.co/kye/latent-mamba) |
+| Training logs | [wandb.ai/apacai/latent-mamba](https://wandb.ai/apacai/latent-mamba) |
 
 A Mamba-2 language model is taught to think silently in continuous space between reading a prompt and writing an answer. The final normalised hidden state is projected back into input-embedding space by a learned *thought projector* (plus a thinking-mode embedding) and fed in as the next input, Coconut-style. A small *halting head*, trained with the PonderNet objective, decides when to stop thinking.
 
@@ -18,9 +27,9 @@ token embedding --> Mamba-2 backbone --> final hidden h --> halting head
                                                                     LM head
 ```
 
-The design rationale (why thoughts go in time rather than depth, pitfalls, related work) is written up in [architecture.md](architecture.md), with the original [interactive architecture diagram](https://claude.ai/chat/a327398f-fd14-42ac-928a-e84e1de7229e?artifact=6098850e-24e4-4ba1-80aa-fee723e678e0).
+The design rationale (why thoughts go in time rather than depth, pitfalls, related work) is written up in [docs/architecture.md](docs/architecture.md), with the original [interactive architecture diagram](https://claude.ai/chat/a327398f-fd14-42ac-928a-e84e1de7229e?artifact=6098850e-24e4-4ba1-80aa-fee723e678e0).
 
-Everything lives in a single file, `main.py`. It is pure Pytorch with no custom kernels: sequences use the chunked SSD scan of Mamba-2 (with an initial state), single tokens use the exact recurrence, and both are differentiable so gradients flow through every thought step.
+The model lives in a single file, [`latent_mamba/main.py`](latent_mamba/main.py). It is pure Pytorch with no custom kernels: sequences use the chunked SSD scan of Mamba-2 (with an initial state), single tokens use the exact recurrence, and both are differentiable so gradients flow through every thought step.
 
 ## Install
 
@@ -30,13 +39,13 @@ $ cd latent-mamba
 $ pip install torch
 ```
 
-Requires Python >= 3.10 and PyTorch >= 2.1.
+Requires Python >= 3.10 and PyTorch >= 2.1. The training pipeline also needs `pip install -r requirements.txt`.
 
 ## Usage
 
 ```python
 import torch
-from main import LatentMamba, LatentMambaConfig
+from latent_mamba.main import LatentMamba, LatentMambaConfig
 
 config = LatentMambaConfig(
     vocab_size = 1000,
@@ -93,7 +102,7 @@ out.halting_distribution  # (batch, max_thoughts), rows sum to 1
 out.expected_thoughts     # (batch,)
 ```
 
-Targets are padded with `IGNORE_INDEX` (`-100`). Prompts within a batch must share a length (left padding would push pad tokens through the recurrent state), so group prompts by length.
+Targets are padded with `IGNORE_INDEX` (`-100`). Prompts of different lengths can share a batch: left-pad them and pass `prompt_mask` (True for real tokens) to `latent_loss`, `ponder_loss` and `generate`. Pad positions get Δ = 0 and a zero conv input, so they leave the state exactly as if they were absent.
 
 ### Inference
 
@@ -134,49 +143,64 @@ Caches are functional (every update returns new tensors), so they can be branche
 ## Test and demo
 
 ```bash
-$ python main.py
+$ python latent_mamba/main.py
 ```
 
-This runs `self_test()`, which checks that the chunked scan matches the exact recurrence, that prefill + cached decoding matches a single full pass, that state size is independent of thought count, and that gradients reach both the thought projector and halting head. It then runs `run_demo()`, which trains a tiny model through the full recipe (language CoT, Coconut curriculum, PonderNet halting) on k-hop pointer chasing and reports accuracy and thoughts used per hop count, against fixed-budget, no-thought and zero-ablated baselines.
+This runs `self_test()`, which checks that the chunked scan matches the exact recurrence, that prefill + cached decoding matches a single full pass, that state size is independent of thought count, that gradients reach both the thought projector and halting head, and that left padding is exact. It then runs `run_demo()`, which trains a tiny model through the full recipe (language CoT, Coconut curriculum, PonderNet halting) on k-hop pointer chasing and reports accuracy and thoughts used per hop count, against fixed-budget, no-thought and zero-ablated baselines.
 
 ```python
-from main import self_test, run_demo
+from latent_mamba.main import self_test, run_demo
 
 self_test(device = 'cpu')
 model = run_demo(steps_per_stage = 600, ponder_steps = 800, device = 'cuda')
 ```
 
-The demo is a smoke test of the pipeline, not a benchmark. The paper does not report trained-model results yet; see Section 6 for the proposed evaluation protocol.
+The demo is a smoke test of the pipeline, not a benchmark. Real benchmark results are below.
 
 ## Training on reasoning benchmarks
 
-`train.py` fine-tunes pretrained Mamba-2 (`state-spaces/mamba2-130m`, `-370m`, ...) on Coconut's GSM8k-Aug, ProsQA and ProntoQA with the full recipe. It compares against the same Mamba with no CoT, with written CoT, and against a Coconut GPT-2 of matched size, then benchmarks memory and latency against thinking budget. Runs log to Weights & Biases and upload to [kye/latent-mamba](https://huggingface.co/kye/latent-mamba).
+[`latent_mamba/train.py`](latent_mamba/train.py) fine-tunes pretrained Mamba-2 (`state-spaces/mamba2-130m`, `-370m`, ...) on Coconut's GSM8k-Aug, ProsQA and ProntoQA with the full recipe. It compares against the same Mamba with no CoT, with written CoT, and against a Coconut GPT-2 of matched size, then benchmarks memory and latency against thinking budget. Runs log to [Weights & Biases](https://wandb.ai/apacai/latent-mamba) and upload to [kye/latent-mamba](https://huggingface.co/kye/latent-mamba).
 
 ```bash
 $ pip install -r requirements.txt
-$ python train.py data --dataset gsm8k prosqa
-$ torchrun --nproc_per_node 4 train.py train --model mamba2-130m --dataset prosqa --method latent --wandb
-$ python train.py eval --ckpt runs/prosqa-mamba2-130m-latent/ponder.pt
+$ python latent_mamba/train.py data --dataset gsm8k prosqa
+$ torchrun --nproc_per_node 4 latent_mamba/train.py train --model mamba2-130m --dataset prosqa --method latent --wandb
+$ python latent_mamba/train.py eval --ckpt runs/prosqa-mamba2-130m-latent/ponder.pt
 ```
 
-`scripts/run_pipeline.sh` runs everything for one model and dataset, and the `Dockerfile` wraps it. See [RUNPOD.md](RUNPOD.md) for GPUs and step-by-step instructions.
+[`scripts/run_pipeline.sh`](scripts/run_pipeline.sh) runs everything for one model and dataset, and the [`Dockerfile`](Dockerfile) wraps it. See [docs/RUNPOD.md](docs/RUNPOD.md) for GPUs and step-by-step instructions.
+
+## Results
+
+ProsQA, Mamba-2 130M fine-tuned from the pretrained checkpoint on one H100, validation accuracy (300 questions, chance 50%). Details in Section 6 of the [paper](docs/paper.pdf).
+
+| Model | Thoughts | Written reasoning | Val. accuracy |
+|---|---|---|---|
+| No CoT | 0 | none | 80.0% |
+| Written CoT | 0 | all steps | 74.3% |
+| **Latent Mamba** (final stage) | **6** | **none** | **98.7%** |
+
+These are validation results from a single run. Test-set accuracy, thought ablations, learned halting, the Coconut GPT-2 baseline and measured memory are still running.
 
 ## Todo
 
 - [x] load pretrained Mamba-2 weights (the parameter names already match)
 - [ ] run the proposed evaluation (H1 - H3) on pointer chasing
-- [ ] GSM8K, ProsQA and ProntoQA following the Coconut settings (`train.py`, ready to run)
-- [ ] memory and latency comparison against a Coconut Transformer of matched size (`train.py bench`)
+- [x] ProsQA following the Coconut settings (validation: 98.7% latent vs 74.3% written CoT vs 80.0% no CoT)
+- [ ] ProsQA test set, thought ablations and learned halting
+- [ ] ProntoQA and GSM8k
+- [ ] memory and latency comparison against a Coconut Transformer of matched size (`latent_mamba/train.py bench`)
 
 ## Citations
 
 ```bibtex
-@techreport{kye2026latentmamba,
+@techreport{gomez2026latentmamba,
     title   = {Latent Mamba: Adaptive Continuous Reasoning in Constant Memory},
-    author  = {Kye},
+    author  = {Kye Gomez},
     year    = {2026},
     month   = {November},
-    institution = {The Swarm Corporation}
+    institution = {Swarms Corp},
+    url     = {https://github.com/The-Swarm-Corporation/latent-mamba}
 }
 ```
 

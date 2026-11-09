@@ -65,9 +65,9 @@ fi
 
 launch() {
   if [ "$NGPU" -gt 1 ]; then
-    torchrun --standalone --nproc_per_node "$NGPU" train.py "$@"
+    torchrun --standalone --nproc_per_node "$NGPU" latent_mamba/train.py "$@"
   else
-    python train.py "$@"
+    python latent_mamba/train.py "$@"
   fi
 }
 run_dir() { echo "$RUNS/$DATASET-$MODEL-$1"; }
@@ -77,7 +77,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || tr
 
 # 1. Data
 if [ ! -f "$DATA/${DATASET}_test.json" ]; then
-  python train.py data --dataset "$DATASET" --data-dir "$DATA"
+  python latent_mamba/train.py data --dataset "$DATASET" --data-dir "$DATA"
   [ -f "$DATA/${DATASET}_test.json" ] || { echo "no $DATASET data (ProntoQA must be generated first, see above)"; false; }
 fi
 
@@ -129,17 +129,17 @@ if [ "$BENCH" = 1 ]; then
     bench_flags=()
     [ -n "${WANDB_API_KEY:-}" ] && bench_flags+=(--wandb --wandb-project "${WANDB_PROJECT:-latent-mamba}")
     # shellcheck disable=SC2086
-    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} python train.py bench --models $pair --dtype bf16 \
+    CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0} python latent_mamba/train.py bench --models $pair --dtype bf16 \
       --out "$bench" ${bench_flags[@]+"${bench_flags[@]}"}
   fi
 fi
 
 # 5. Report over every run on this volume, then upload the report and benchmark
-python train.py report --runs "$RUNS" --out "$RUNS/report.md"
+python latent_mamba/train.py report --runs "$RUNS" --out "$RUNS/report.md"
 if [ -n "${HF_TOKEN:-}" ]; then
-  python train.py upload --path "$RUNS/report.md" --path-in-repo report.md --hf-repo "$HF_REPO"
+  python latent_mamba/train.py upload --path "$RUNS/report.md" --path-in-repo report.md --hf-repo "$HF_REPO"
   [ -f "$RUNS/bench/bench-$MODEL.json" ] && \
-    python train.py upload --path "$RUNS/bench/bench-$MODEL.json" --path-in-repo "bench/bench-$MODEL.json" --hf-repo "$HF_REPO"
+    python latent_mamba/train.py upload --path "$RUNS/bench/bench-$MODEL.json" --path-in-repo "bench/bench-$MODEL.json" --hf-repo "$HF_REPO"
 fi
 
 trap - ERR
