@@ -2,14 +2,6 @@
 
 Implementation of <a href="docs/paper.pdf">Latent Mamba</a>, adaptive continuous reasoning in constant memory, in Pytorch
 
-| | |
-|---|---|
-| Paper | [docs/paper.pdf](docs/paper.pdf) · LaTeX source [docs/latent_mamba.tex](docs/latent_mamba.tex) |
-| Model | [latent_mamba/main.py](latent_mamba/main.py) |
-| Training & evaluation | [latent_mamba/train.py](latent_mamba/train.py) · [scripts/run_pipeline.sh](scripts/run_pipeline.sh) · [Dockerfile](Dockerfile) |
-| Guides | [docs/RUNPOD.md](docs/RUNPOD.md) (GPUs, RunPod) · [docs/architecture.md](docs/architecture.md) (design notes) |
-| Checkpoints | [huggingface.co/kye/latent-mamba](https://huggingface.co/kye/latent-mamba) |
-| Training logs | [wandb.ai/apacai/latent-mamba](https://wandb.ai/apacai/latent-mamba) |
 
 A Mamba-2 language model is taught to think silently in continuous space between reading a prompt and writing an answer. The final normalised hidden state is projected back into input-embedding space by a learned *thought projector* (plus a thinking-mode embedding) and fed in as the next input, Coconut-style. A small *halting head*, trained with the PonderNet objective, decides when to stop thinking.
 
@@ -156,6 +148,17 @@ model = run_demo(steps_per_stage = 600, ponder_steps = 800, device = 'cuda')
 ```
 
 The demo is a smoke test of the pipeline, not a benchmark. Real benchmark results are below.
+
+
+## Links
+|---|---|
+| Paper | [docs/paper.pdf](docs/paper.pdf) · LaTeX source [docs/latent_mamba.tex](docs/latent_mamba.tex) |
+| Model | [latent_mamba/main.py](latent_mamba/main.py) |
+| Training & evaluation | [latent_mamba/train.py](latent_mamba/train.py) · [scripts/run_pipeline.sh](scripts/run_pipeline.sh) · [Dockerfile](Dockerfile) |
+| Guides | [docs/RUNPOD.md](docs/RUNPOD.md) (GPUs, RunPod) · [docs/architecture.md](docs/architecture.md) (design notes) |
+| Checkpoints | [huggingface.co/kye/latent-mamba](https://huggingface.co/kye/latent-mamba) |
+| Training logs | [wandb.ai/apacai/latent-mamba](https://wandb.ai/apacai/latent-mamba) |
+
 
 ## Training on reasoning benchmarks
 
