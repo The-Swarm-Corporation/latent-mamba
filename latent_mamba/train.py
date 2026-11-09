@@ -800,6 +800,7 @@ def _step_fused(x, dt, a, b, c, state):  # type: ignore[no-untyped-def]
     from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 
     heads, headdim, d_state = state.shape[1:]
+    zero = torch.zeros(heads, device=x.device)[:, None].expand(heads, headdim)
     new_state = state.float().clone()
     y = selective_state_update(
         new_state,
@@ -808,6 +809,12 @@ def _step_fused(x, dt, a, b, c, state):  # type: ignore[no-untyped-def]
         a.float()[:, None, None].expand(heads, headdim, d_state),
         b[:, None, :].contiguous(),
         c[:, None, :].contiguous(),
+        # mamba-ssm 2.3.1 reads D.stride() and dt_bias.stride() without checking
+        # for None, so both are passed as zeros (stride 0 keeps the fast path).
+        # They add nothing: dt is already biased and softplus-ed, and the D skip
+        # connection is added by the mixer.
+        D=zero,
+        dt_bias=zero,
         dt_softplus=False,
     )
     return y, new_state
@@ -985,22 +992,19 @@ def enable_compiled_thoughts(
         eager, mode="reduce-overhead" if mode == "cudagraphs" else None
     )
 
-    def run(fn):  # type: ignore[no-untyped-def]
-        g = torch.Generator(device="cpu").manual_seed(3)
-        cfg = model.config
-        h = torch.randn(2, cfg.d_model, generator=g).to(device).requires_grad_()
-        cache = lm.MambaCache(
-            [
-                lm.LayerState(
-                    torch.randn(2, cfg.conv_dim, cfg.d_conv - 1, generator=g).to(device),
-                    torch.randn(2, cfg.n_heads, cfg.headdim, cfg.d_state, generator=g).to(device),
-                )
-                for _ in range(cfg.n_layers)
-            ]
-        )
-        for t in lm._tensors(cache):  # as in training, where the cache carries gradients
-            t.requires_grad_()
-        with autocast(device, dtype):
+    # Inputs with realistic magnitudes: the state after a short random prompt.
+    # (On random states, bf16 itself is unstable, so nothing can be compared.)
+    g = torch.Generator(device="cpu").manual_seed(3)
+    ids = torch.randint(0, bundle.bot_id, (2, 24), generator=g)
+    ids[:, -1] = bundle.bot_id
+    with torch.no_grad():
+        h0, c0 = model.encode_prompt(ids.to(device))
+
+    def run(fn, dt):  # type: ignore[no-untyped-def]
+        h = h0.detach().clone().requires_grad_()
+        # as in training, where the cache carries gradients
+        cache = lm._map_tensors(c0, lambda t: t.detach().clone().requires_grad_())
+        with autocast(device, dt):
             h1, c1, logit = fn(h, cache)
             h2, c2, logit2 = fn(h1, c1)
         loss = (
@@ -1019,17 +1023,19 @@ def enable_compiled_thoughts(
         return out
 
     try:
-        torch.manual_seed(0)
-        ref = run(eager)
+        # Judge both against float32: in bf16, compiled and eager round
+        # differently, so the compiled step passes if it is about as accurate.
+        exact = run(eager, "fp32")
+        ref = run(eager, dtype)
         if mode == "cudagraphs":
             torch.compiler.cudagraph_mark_step_begin()
-        torch.manual_seed(0)
-        got = run(compiled)
-        for name, r, o in zip(("h", "halt", "dh", "dW"), ref, got):
-            err = _rel_err(o, r)
-            if not err < 2e-2:
+        got = run(compiled, dtype)
+        for name, x, r, o in zip(("h", "halt", "dh", "dW"), exact, ref, got):
+            err, base = _rel_err(o, x), _rel_err(r, x)
+            if not err <= 3 * base + 1e-3:
                 raise RuntimeError(
-                    f"compiled thought step disagrees with eager ({name} rel err {err:.2e})"
+                    f"compiled thought step is less accurate than eager ({name}: rel err "
+                    f"{err:.2e} vs {base:.2e} against float32)"
                 )
     except Exception as exc:
         model.zero_grad(set_to_none=True)

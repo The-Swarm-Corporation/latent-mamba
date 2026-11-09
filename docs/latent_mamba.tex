@@ -80,7 +80,7 @@ Selective state-space models (SSMs)~\cite{gu2022s4} such as Mamba and Mamba-2~\c
 \item \textbf{Latent Mamba} (Figure~\ref{fig:arch}): a thought projector with a thinking-mode embedding, a halting head, and functional fixed-size state handling. The added parameters are about 0.3\% of a 2.7B model and 0.6\% of a 130M model.
 \item A training recipe (Algorithms~\ref{alg:curriculum} and~\ref{alg:ponder}) and an adaptive inference procedure (Algorithm~\ref{alg:generate}). PonderNet scoring is batched across thought steps, which is cheap only because SSM state is fixed-size.
 \item Exact batching of prompts of different lengths (Proposition~\ref{prop:padding}) and a training path that cuts saved activations at batch 32 from 75\,GiB to 4.2\,GiB with identical gradients (Section~\ref{sec:scale}).
-\item A reference implementation that loads pretrained Mamba-2 checkpoints without renaming, numerical verification of its kernels (Table~\ref{tab:verify}), and an experiment on ProsQA (Section~\ref{sec:experiments}) where the fully latent model reaches 99.0\% test accuracy against 70.8\% (written CoT) and 74.6\% (no CoT), with thought ablations, a thinking-budget sweep, learned halting, and measured memory and latency.
+\item A reference implementation that loads pretrained Mamba-2 checkpoints without renaming, numerical verification of its kernels (Table~\ref{tab:verify}), and an experiment on ProsQA (Section~\ref{sec:experiments}) where the fully latent model reaches 99.0\% test accuracy against 70.8\% (written CoT) and 74.6\% (no CoT), with thought ablations, a thinking-budget sweep, learned halting, and measured memory and latency: with fused kernels and CUDA graphs, a thought costs 2.0\,ms, against 6.8\,ms for a GPT-2 decoding step.
 \end{itemize}
 
 % =========================================================================
@@ -244,7 +244,7 @@ L\,\big[(K-1)(d_{\text{inner}} + 2N) + HPN\big]
 \end{equation}
 values, independent of both prompt length and thought count. For the Mamba-2 2.7B configuration ($L{=}64$, $d{=}2560$, $N{=}128$, $P{=}64$, $K{=}4$) this is 671{,}488 values per layer, or 82.0\,MiB in fp16. A 32-layer Transformer of the same width with multi-head attention stores 0.3125\,MiB of KV cache per token; with $4\times$ grouped-query attention~\cite{ainslie2023gqa}, 0.078\,MiB. Multi-query attention~\cite{shazeer2019mqa} shrinks the per-token cost further, but the cache still grows with every token.
 
-Figure~\ref{fig:memory} compares the three after a 512-token prompt. The grouped-query Transformer is smaller until about 1{,}050 cached tokens, so the advantage is not universal. Beyond that point every Transformer thought costs memory, while Latent Mamba's footprint stays flat at any thinking budget. At the scale used in our experiments the comparison is starker: Mamba-2 130M ($L{=}24$, $d_{\text{inner}}{=}1536$, $H{=}24$) holds 9.25\,MiB of state in bf16, while GPT-2 124M~\cite{radford2019gpt2} stores 36\,KiB of KV cache per token, so its cache already exceeds Latent Mamba's whole state after 263 tokens. Section~\ref{sec:bench} measures both on GPU.
+Figure~\ref{fig:memory} compares the three after a 512-token prompt. The grouped-query Transformer is smaller until about 1{,}050 cached tokens, so the advantage is not universal. Beyond that point every Transformer thought costs memory, while Latent Mamba's footprint stays flat at any thinking budget. At the scale used in our experiments the comparison is starker: Mamba-2 130M ($L{=}24$, $d_{\text{inner}}{=}1536$, $H{=}24$) holds 9.25\,MiB of state in bf16, while GPT-2 124M~\cite{radford2019gpt2} (117M in the original count) stores 36\,KiB of KV cache per token, so its cache already exceeds Latent Mamba's whole state after 263 tokens. Section~\ref{sec:bench} measures both on GPU.
 
 \begin{figure}[t]
 \centering
@@ -364,15 +364,18 @@ Our first full-size run ran out of memory on a 93\,GiB GPU at batch 32. We measu
 
 \paragraph{Activation checkpointing.} We recompute each Mamba layer during the backward pass instead of storing its internals~\cite{chen2016checkpoint}. Because state updates are functional, a layer is a pure function of (input, state, mask) and checkpointing needs no special handling. Saved activations for a batch of 32 of the longest prompts fall from 75.0\,GiB to 4.2\,GiB. Loss and gradients are identical (maximum relative difference 0 in float32), at the cost of about one extra forward pass.
 
-\paragraph{Precision.} We train under bf16 autocast~\cite{micikevicius2018mixed} but run the selective scan and the single-step recurrence in float32: the scan exponentiates cumulative sums of $\Delta a$, which bf16 represents poorly. An optional fused path uses the Triton kernels of \texttt{mamba\_ssm} for prompts and answers. It is checked against the reference scan, forward and backward, before use.
+\paragraph{Precision.} We train under bf16 autocast~\cite{micikevicius2018mixed} but run the selective scan and the single-step recurrence in float32: the scan exponentiates cumulative sums of $\Delta a$, which bf16 represents poorly. Section~\ref{sec:impl} describes optional fused kernels, each checked against this reference before use.
 
 % =========================================================================
 \section{Reference implementation}
+\label{sec:impl}
 % =========================================================================
 
-The implementation is plain PyTorch with no custom kernels. Sequences use the chunked SSD algorithm~\cite{dao2024ssd} started from an arbitrary initial state; single tokens use the exact recurrence of Equation~\eqref{eq:ssm}. State updates are functional: they return new tensors, so a cache can be branched, frozen per example or concatenated without side effects, as Algorithms~\ref{alg:curriculum} and~\ref{alg:ponder} require. The file also contains a diagnostic ablation that replaces thought content with zeros, which turns thoughts into pause tokens~\cite{goyal2024pause}, or with noise of matching RMS.
+The model is written in plain PyTorch. Sequences use the chunked SSD algorithm~\cite{dao2024ssd} started from an arbitrary initial state; single tokens use the exact recurrence of Equation~\eqref{eq:ssm}. State updates are functional: they return new tensors, so a cache can be branched, frozen per example or concatenated without side effects, as Algorithms~\ref{alg:curriculum} and~\ref{alg:ponder} require. The file also contains a diagnostic ablation that replaces thought content with zeros, which turns thoughts into pause tokens~\cite{goyal2024pause}, or with noise of matching RMS.
 
-\paragraph{Pretrained weights.} The mixer follows Mamba-2's parameterisation (input projection to $[z, x, b, c, \Delta]$, depthwise causal convolution over $(x, b, c)$, per-head $A$, $\Delta$ bias and $D$, gated RMSNorm), and the parameter names of the public \texttt{state-spaces/mamba2-*} checkpoints, pretrained on the Pile~\cite{gao2020pile}, already match ours, so they load without renaming; only the two new modules are initialised fresh. As a sanity check, the ported 130M model scores 2.63 nats per token on a held-out Wikipedia paragraph and continues ``The capital of France is'' fluently. The three special tokens (\bot, \eot, pad) use spare rows of the checkpoint's padded vocabulary and are initialised from the embedding of ``\texttt{<<}'', as Coconut does.
+\paragraph{Fast paths.} On CUDA the training script replaces parts of the reference by default. Prompts and answers use the fused chunked scan of \texttt{mamba\_ssm}, forward and backward. In inference, thoughts and decoded tokens use the fused single-step kernels of \texttt{mamba\_ssm} and \texttt{causal-conv1d}, and each step is captured once per batch shape as a CUDA graph and replayed, which removes most kernel-launch overhead. The fused single-step kernels have no backward pass, so training thoughts instead use the reference step compiled with \texttt{torch.compile}. Each fast path is checked against the reference at startup (forward, and backward where used in training) and falls back to it on disagreement. The accuracy results below use the reference implementation; the latency results of Section~\ref{sec:bench} use the fast paths.
+
+\paragraph{Pretrained weights.} The mixer follows Mamba-2's parameterisation (input projection to $[z, x, b, c, \Delta]$, depthwise causal convolution over $(x, b, c)$, per-head $A$, $\Delta$ bias and $D$, gated RMSNorm), and the parameter names of the public \texttt{state-spaces/mamba2-*} checkpoints, pretrained on 300B tokens of the Pile~\cite{gao2020pile,dao2024ssd}, already match ours, so they load without renaming; only the two new modules are initialised fresh. As a sanity check, the ported 130M model scores 2.63 nats per token on a held-out Wikipedia paragraph and continues ``The capital of France is'' fluently. The three special tokens (\bot, \eot, pad) use spare rows of the checkpoint's padded vocabulary and are initialised from the embedding of ``\texttt{<<}'', as Coconut does.
 
 \paragraph{Verification.} The method depends on one property: continuing from a stored state must give exactly the result of an uninterrupted pass. Table~\ref{tab:verify} reports the checks, run in float64 on the current implementation. The scan uses three chunks with end padding and a random initial state.
 
@@ -588,7 +591,7 @@ Latent Mamba, learned halting & 98.5 & \textbf{99.1} & 97.1 & \textbf{100} \\
 
 \paragraph{Learned halting finds the knee of the curve but adapts only weakly.} The halting head stops after 3.11 thoughts on average and scores 98.6\%, half the thoughts of the fixed mode for 0.4 points (two questions). A fixed budget of three scores the same 98.6\%, so on this task the learned rule matches, but does not beat, a well-chosen fixed budget; its value is that it finds this budget without a sweep. Its thought count rises only slightly with difficulty, from 2.99 on three-step questions to 3.42 on six-step ones (Table~\ref{tab:bysteps}). The convergence rule never fired at tolerance $10^{-2}$ and always used all six thoughts: consecutive thoughts keep changing by more than 1\%, so the trajectory does not settle to a fixed point within the training budget.
 
-\paragraph{Cost.} The two baselines took about 44 and 41 minutes on one H100 NVL, including validation, and the full 55-epoch latent run took 14.0 hours. Each thought is one more sequential pass through all 24 layers, so throughput falls as the curriculum adds thoughts (Table~\ref{tab:speed}): from 1.06 batches per second at stage 0 to 0.50 at six thoughts, roughly 0.18 seconds per thought per batch of 32. The thought steps process one token per example and are cheap in arithmetic; we attribute most of their cost to per-layer kernel launches, which a fused single-step kernel or CUDA graphs would reduce.
+\paragraph{Cost.} The two baselines took about 44 and 41 minutes on one H100 NVL, including validation, and the full 55-epoch latent run took 14.0 hours. Each thought is one more sequential pass through all 24 layers, so throughput falls as the curriculum adds thoughts (Table~\ref{tab:speed}): from 1.06 batches per second at stage 0 to 0.50 at six thoughts, roughly 0.18 seconds per thought per batch of 32. The thought steps process one token per example and are cheap in arithmetic; we attribute most of their cost to per-layer kernel launches. Compiling the thought step (Section~\ref{sec:impl}) targets this cost; its effect on training throughput has not been measured yet.
 
 \begin{table}[t]
 \centering
@@ -608,7 +611,7 @@ Batches / s (batch 32) & 1.06 & 0.92 & 0.82 & 0.71 & 0.59 & 0.57 & 0.50 & 0.53 &
 \subsection{Inference memory and latency}
 \label{sec:bench}
 
-We measure both architectures at equal size on the same H100 NVL: Mamba-2 130M and GPT-2 124M, batch 1, a 512-token prompt, bf16 weights, and $n$ thoughts followed by one answer token (Table~\ref{tab:bench}). Weights are random, which does not affect memory or time. State size is read from the cache objects, peak memory is the maximum allocated above the weights during generation, and latency is the median of repeated runs.
+We measure Mamba-2 130M and GPT-2 124M on the same GPU in one session: batch 1, a 512-token prompt, bf16 weights, and $n$ thoughts followed by one answer token (Table~\ref{tab:bench}). Weights are random, which does not affect memory or time; latency is the median of repeated runs. Latent Mamba uses the fused scan, the fused single-token convolution and CUDA graphs (the single-step SSM update used the reference in this run). GPT-2 uses the Hugging Face implementation with its KV cache but \emph{without} CUDA graphs or compilation, so it is the less optimised of the two.
 
 \begin{table}[t]
 \centering
@@ -620,25 +623,22 @@ We measure both architectures at equal size on the same H100 NVL: Mamba-2 130M a
 \multirow{2}{*}{State / KV cache (MiB)} & Latent Mamba & 18.2 & 18.2 & 18.2 & 18.2 & 18.2 & 18.2 & 18.2 \\
 & GPT-2 & 18.0 & 18.6 & 20.3 & 27.0 & 34.9 & -- & -- \\
 \midrule
-\multirow{2}{*}{Peak extra memory (MiB)} & Latent Mamba & 154 & 154 & 154 & 154 & 154 & 154 & 154 \\
-& GPT-2 & 34.6 & 34.6 & 34.6 & 38.7 & 38.7 & -- & -- \\
+\multirow{2}{*}{Peak extra memory (MiB)} & Latent Mamba & 80.0 & 97.4 & 97.4 & 97.4 & 97.4 & 97.4 & 97.4 \\
+& GPT-2 & 34.5 & 34.5 & 34.5 & 43.1 & 43.1 & -- & -- \\
 \midrule
-\multirow{2}{*}{Latency (s)} & Latent Mamba & 0.07 & 0.41 & 1.40 & 5.89 & 10.20 & 20.19 & 55.91 \\
-& GPT-2 & 0.01 & 0.11 & 0.44 & 1.64 & 1.85 & -- & -- \\
+\multirow{2}{*}{Latency (s)} & Latent Mamba & 0.035 & 0.066 & 0.161 & 0.544 & 0.988 & 2.07 & 8.10 \\
+& GPT-2 & 0.015 & 0.116 & 0.446 & 1.75 & 3.26 & -- & -- \\
 \bottomrule
 \end{tabular}
-\caption{Inference after a 512-token prompt on one H100 NVL (batch 1, bf16), using the reference PyTorch implementation for Mamba. ``--'': beyond GPT-2's 1{,}024-position context.}
+\caption{Inference after a 512-token prompt on one GPU (batch 1, bf16). Latent Mamba uses fused kernels and CUDA graphs; GPT-2 is the Hugging Face implementation without CUDA graphs or compilation. ``--'': beyond GPT-2's 1{,}024-position context.}
 \label{tab:bench}
 \end{table}
 
 \paragraph{The state is constant.} Latent Mamba's state stays at 18.2\,MiB from zero to 4{,}096 thoughts. This is twice the 9.25\,MiB computed from Equation~\eqref{eq:mem} because the implementation keeps the SSM state in float32 (Section~\ref{sec:scale}); only the convolution window is bf16. GPT-2's cache grows by 36\,KiB per token and passes the Mamba state after about seven thoughts. At 480 thoughts it is $1.9\times$ larger, and GPT-2 cannot think beyond its 1{,}024-position context at all.
 
-\paragraph{Peak memory favours GPT-2 at this scale.} Peak memory above the weights is 154\,MiB for Latent Mamba at every budget, against 35--39\,MiB for GPT-2. The peak is set by the 512-token prefill, where the reference chunked scan materialises float32 intermediates, not by thinking. At six thoughts the KV cache a Transformer adds is negligible, so the constant-memory advantage matters for reasoning much longer than ProsQA's.
+\paragraph{A thought costs 2.0\,ms, a GPT-2 step 6.8\,ms.} Beyond the prompt, Latent Mamba's latency grows by 2.0\,ms per thought, from 16 to 4{,}096 thoughts alike; GPT-2's grows by 6.8\,ms per position, so at 480 thoughts it takes 3.26\,s against 0.99\,s. A thought updates a fixed-size state in one replayed CUDA graph, while each GPT-2 step attends over a growing cache. Part of the gap is optimisation, not architecture: a Transformer with CUDA graphs and a static cache would be faster than measured here, a comparison we have not run. GPT-2 reads the prompt faster (15 against 35\,ms). The pure PyTorch implementation took about 21\,ms per thought in an earlier session on an H100 NVL.
 
-\subsection{What remains}
-\label{sec:remaining}
-
-Four comparisons are still missing: Coconut with GPT-2 124M trained in the same pipeline, which isolates the backbone; a pause-token model trained through the same curriculum with empty thoughts, which separates thought content from extra computation as a trained rather than test-time control; a no-CoT model trained for 55 epochs, which matches training length; and more seeds and model sizes, together with ProntoQA and GSM8k. The released pipeline already trains the GPT-2 baseline and runs GSM8k.
+\paragraph{Peak memory favours GPT-2 at this scale.} Peak memory above the weights is 80--97\,MiB for Latent Mamba at every budget, against 35--43\,MiB for GPT-2. The peak is set by the 512-token prompt pass, not by thinking. At six thoughts the KV cache a Transformer adds is negligible, so the constant-memory advantage matters for reasoning much longer than ProsQA's.
 
 % =========================================================================
 \section{Discussion: why does latent reasoning help here?}
@@ -647,7 +647,7 @@ Four comparisons are still missing: Coconut with GPT-2 124M trained in the same 
 
 The thought ablations of Table~\ref{tab:test} show that the content of the thoughts matters. Why it helps on this task is less certain; the following explanations are hypotheses.
 
-\paragraph{Search without committing.} A written chain must choose one node of the graph per sentence. A continuous thought is a vector and can represent several candidate nodes at once, narrowing them over successive thoughts, which resembles breadth-first search. Coconut observed exactly this in GPT-2 on ProsQA by decoding thoughts through the language-model head~\cite{hao2024coconut}. The shape of our curve supports the same reading: little changes while only one or two steps are latent, and accuracy rises once three or more consecutive steps can stay in latent space, where keeping alternatives alive pays off.
+\paragraph{Search without committing.} A written chain must choose one node of the graph per sentence. A continuous thought is a vector and can represent several candidate nodes at once, narrowing them over successive thoughts, which resembles breadth-first search. Coconut observed exactly this in GPT-2 on ProsQA: switched back to language after one or two thoughts, the model spreads probability over several candidate next nodes rather than committing to one~\cite{hao2024coconut}. The shape of our curve supports the same reading: little changes while only one or two steps are latent, and accuracy rises once three or more consecutive steps can stay in latent space, where keeping alternatives alive pays off.
 
 \paragraph{Depth on demand.} Each thought runs the full nonlinear stack once more, so six thoughts add 144 layers of computation on top of the prompt pass. Within a single pass, Mamba's state update is linear (Equation~\eqref{eq:ssm}); the thought loop supplies the nonlinear depth that path-finding needs.
 
@@ -661,19 +661,19 @@ The thought ablations of Table~\ref{tab:test} show that the content of the thoug
 
 \paragraph{Latent reasoning.} Coconut~\cite{hao2024coconut} introduced continuous thoughts and observed breadth-first-search-like behaviour. Implicit CoT~\cite{deng2024icot} internalises reasoning steps through a curriculum. Pause tokens~\cite{goyal2024pause} and filler tokens~\cite{pfau2024dots} add compute without content; Pfau et al.\ show that such tokens can still carry hidden computation, which is why our zero-thought ablation is an informative control rather than a trivial one. Zhu et al.~\cite{zhu2025survey} survey the area and distinguish vertical from horizontal recurrence.
 
-\paragraph{Recurrent depth.} Universal Transformers~\cite{dehghani2019universal} share one block across depth with ACT halting, deep equilibrium models~\cite{bai2019deq} run a layer to a fixed point, and recurrent networks trained on easy instances can extrapolate to harder ones by iterating longer~\cite{schwarzschild2021easyhard}. Geiping et al.~\cite{geiping2025recurrent} train a depth-recurrent Transformer with randomly sampled iteration counts and obtain zero-shot per-token adaptive exit. RD-VLA~\cite{tur2026rdvla} stops when the latent state converges. SST V2~\cite{aviss2026sst} streams a latent state across positions in a Transformer and deliberates per position. Wang and Reid~\cite{wang2026trmmamba} place Mamba-2 hybrid blocks inside a tiny recursive reasoning model~\cite{jolicoeur2025trm}. They leave open whether the recursion can be folded into the SSM's own state updates; Proposition~\ref{prop:collapse} and Latent Mamba give one such folding.
+\paragraph{Recurrent depth.} Universal Transformers~\cite{dehghani2019universal} share one block across depth, optionally with per-position ACT halting, deep equilibrium models~\cite{bai2019deq} solve for a layer's fixed point by root-finding, and recurrent networks trained on easy instances can extrapolate to harder ones by iterating longer~\cite{schwarzschild2021easyhard}. Geiping et al.~\cite{geiping2025recurrent} train a depth-recurrent Transformer with randomly sampled iteration counts and obtain zero-shot per-token adaptive exit. RD-VLA~\cite{tur2026rdvla} stops when the latent state converges. SST V2~\cite{aviss2026sst} streams a latent state across positions in a Transformer and deliberates per position. Wang and Reid~\cite{wang2026trmmamba} place Mamba-2 hybrid blocks inside a tiny recursive reasoning model~\cite{jolicoeur2025trm}. They leave open whether the recursion can be folded into the SSM's own state updates; Proposition~\ref{prop:collapse} and Latent Mamba give one such folding.
 
-\paragraph{Adaptive computation and SSM expressivity.} We use ACT~\cite{graves2016act} and PonderNet~\cite{banino2021pondernet} directly. Diagonal SSMs with positive decay cannot track some states in a single pass~\cite{merrill2024illusion}; allowing negative eigenvalues helps~\cite{grazzi2025negative}. Thought steps offer a complementary route: more nonlinear passes rather than a richer transition.
+\paragraph{Adaptive computation and SSM expressivity.} We use ACT~\cite{graves2016act} and PonderNet~\cite{banino2021pondernet} directly. Linear and diagonal SSMs such as S4 and Mamba, at fixed depth, cannot track state for problems such as permutation composition~\cite{merrill2024illusion}; with only positive eigenvalues they cannot even solve parity, and allowing negative eigenvalues helps~\cite{grazzi2025negative}. Thought steps offer a complementary route: more nonlinear passes rather than a richer transition.
 
 \paragraph{Hybrid models.} Hybrid architectures interleave attention with Mamba layers to restore exact recall~\cite{lieber2024jamba,waleffe2024mambastudy}. Latent Mamba is compatible with them: thoughts can update the SSM layers while being kept out of the attention layers' KV cache, so memory stays constant in the thinking budget.
 
-\paragraph{Benchmarks.} Besides ProsQA we prepare ProntoQA~\cite{saparov2023prontoqa}, a deduction benchmark over fictional ontologies, and GSM8k~\cite{cobbe2021gsm8k} in the augmented form of implicit CoT~\cite{deng2024icot}, following Coconut's settings.
+\paragraph{Benchmarks.} The pipeline also prepares ProntoQA~\cite{saparov2023prontoqa} and GSM8k~\cite{cobbe2021gsm8k} in implicit CoT's augmented form~\cite{deng2024icot}.
 
 % =========================================================================
 \section{Limitations}
 % =========================================================================
 
-\textbf{Narrow evidence:} one synthetic dataset, one seed and one model size. Test graphs are new but share the training distribution, and ProsQA is close to saturated, so it cannot separate strong methods; the controls of Section~\ref{sec:remaining} are missing. \textbf{Halting:} the learned head matches a fixed budget of three but adapts little to difficulty, and the convergence rule never fires; ProsQA's narrow range of difficulty (3 to 6 steps) may be part of the reason. \textbf{Fixed-size memory cuts both ways:} thinking cannot restore prompt details the state has already lost, so recall-heavy tasks may need hybrid attention layers, with thoughts kept out of their KV cache. \textbf{Interpretability:} thoughts are not text, and decoding them through $W$ is only a probe.
+\textbf{Narrow evidence:} one synthetic dataset, one seed and one model size. Test graphs are new but share the training distribution, and ProsQA is close to saturated, so it cannot separate strong methods. Coconut GPT-2 trained in our pipeline, a pause-token model trained with empty thoughts, and a no-CoT model trained for 55 epochs are still missing. \textbf{Halting:} the learned head matches a fixed budget of three but adapts little to difficulty, and the convergence rule never fires; ProsQA's narrow range of difficulty (3 to 6 steps) may be part of the reason. \textbf{Benchmark scope:} latency was measured at batch 1, for one model size, against a Transformer without CUDA graphs or compilation, so the speed advantage at larger batches, larger models or against an optimised Transformer is untested. \textbf{Fixed-size memory cuts both ways:} thinking cannot restore prompt details the state has already lost, so recall-heavy tasks may need hybrid attention layers, with thoughts kept out of their KV cache. \textbf{Interpretability:} thoughts are not text, and decoding them through $W$ is only a probe.
 
 % =========================================================================
 \section{Conclusion}
@@ -681,18 +681,18 @@ The thought ablations of Table~\ref{tab:test} show that the content of the thoug
 
 In a selective SSM, extra depth with a shared state is the same thing as extra time. Latent Mamba uses this to let a Mamba-2 model think in continuous space for as long as each input requires, at constant memory and with well under 1\% more parameters. Thoughts reuse the backbone unchanged, so the method needs no new kernels, trains from public pretrained checkpoints, and scores every thinking budget in one batched pass during halting training, which a growing KV cache would make expensive.
 
-The experiment supports the idea on held-out data. On ProsQA, a pretrained 130M Mamba-2 fine-tuned with the curriculum answers 99.0\% of test questions while reasoning entirely in latent space, against 70.8\% when the same model writes its reasoning and 74.6\% when it answers directly, and in the range Coconut reports for GPT-2. The thoughts carry the reasoning: with their content zeroed or replaced by noise, accuracy falls to 76--77\%, close to answering without thoughts. A single thought already recovers most of the gain, accuracy saturates at five, and twice the training budget costs under a point. The learned halting head stops after about three thoughts at almost no loss of accuracy, halving inference compute. On GPU, the state stayed at 18.2\,MiB for budgets up to 4{,}096 thoughts, a length GPT-2 cannot reach.
+The experiment supports the idea on held-out data. On ProsQA, a pretrained 130M Mamba-2 fine-tuned with the curriculum answers 99.0\% of test questions while reasoning entirely in latent space, against 70.8\% when the same model writes its reasoning and 74.6\% when it answers directly, and in the range Coconut reports for GPT-2. The thoughts carry the reasoning: with their content zeroed or replaced by noise, accuracy falls to 76--77\%, close to answering without thoughts. A single thought already recovers most of the gain, accuracy saturates at five, and twice the training budget costs under a point. The learned halting head stops after about three thoughts at almost no loss of accuracy, halving inference compute. On GPU, the state stayed at 18.2\,MiB for budgets up to 4{,}096 thoughts, a length GPT-2 cannot reach, and with fused kernels and CUDA graphs a thought took 2.0\,ms against 6.8\,ms for a GPT-2 decoding step.
 
-The results also mark the limits of the current evidence. Halting finds a good budget but matches a fixed budget of three rather than adapting strongly to each question. At this scale and reasoning length, the reference implementation uses more peak memory than a Transformer, so the constant-memory advantage is structural rather than yet practical. Everything rests on one seed of one synthetic task. The next steps are the matched Coconut GPT-2 baseline; trained pause-token and training-length controls; more seeds and model sizes; a fused single-step kernel; tasks with long reasoning, where a constant-size state should matter most; and ProntoQA and the harder GSM8k benchmark, where Coconut trailed written chain-of-thought and Latent Mamba faces its most demanding test.
+The results also mark the limits of the current evidence. Halting finds a good budget but matches a fixed budget of three rather than adapting strongly to each question. At this scale, peak memory is still higher than GPT-2's, the latency comparison is against a Transformer without CUDA graphs, and at ProsQA's reasoning length the constant-memory advantage is structural rather than yet practical. Everything rests on one seed of one synthetic task. The next steps are the matched Coconut GPT-2 baseline; trained pause-token and training-length controls; more seeds and model sizes; a latency comparison against an equally optimised Transformer; tasks with long reasoning, where a constant-size state should matter most; and ProntoQA and the harder GSM8k benchmark, where Coconut trailed written chain-of-thought and Latent Mamba faces its most demanding test.
 
 % =========================================================================
 \begin{thebibliography}{99}
-\setlength{\itemsep}{2pt}
+\setlength{\itemsep}{0.5pt}
 
 \bibitem{ainslie2023gqa} J.~Ainslie, J.~Lee-Thorp, M.~de~Jong, Y.~Zemlyanskiy, F.~Lebr\'on, S.~Sanghai. GQA: Training generalized multi-query transformer models from multi-head checkpoints. EMNLP, 2023.
 \bibitem{aviss2026sst} T.~Aviss. State Stream Transformer (SST) V2: Parallel training of nonlinear recurrence for latent space reasoning. arXiv:2605.00206, 2026.
 \bibitem{bai2019deq} S.~Bai, J.~Z.~Kolter, V.~Koltun. Deep equilibrium models. NeurIPS, 2019.
-\bibitem{banino2021pondernet} A.~Banino, J.~Balaguer, C.~Blundell. PonderNet: Learning to ponder. arXiv:2107.05407, 2021.
+\bibitem{banino2021pondernet} A.~Banino, J.~Balaguer, C.~Blundell. PonderNet: Learning to ponder. 8th ICML Workshop on Automated Machine Learning, 2021. arXiv:2107.05407.
 \bibitem{black2022neox} S.~Black, S.~Biderman, E.~Hallahan, et al. GPT-NeoX-20B: An open-source autoregressive language model. Proceedings of BigScience Episode \#5, Workshop on Challenges \& Perspectives in Creating Large Language Models, 2022.
 \bibitem{blelloch1990prefix} G.~E.~Blelloch. Prefix sums and their applications. Technical report CMU-CS-90-190, Carnegie Mellon University, 1990.
 \bibitem{chen2016checkpoint} T.~Chen, B.~Xu, C.~Zhang, C.~Guestrin. Training deep nets with sublinear memory cost. arXiv:1604.06174, 2016.
@@ -702,13 +702,13 @@ The results also mark the limits of the current evidence. Halting finds a good b
 \bibitem{deng2024icot} Y.~Deng, Y.~Choi, S.~Shieber. From explicit CoT to implicit CoT: Learning to internalize CoT step by step. arXiv:2405.14838, 2024.
 \bibitem{gao2020pile} L.~Gao, S.~Biderman, S.~Black, et al. The Pile: An 800GB dataset of diverse text for language modeling. arXiv:2101.00027, 2020.
 \bibitem{geiping2025recurrent} J.~Geiping, S.~McLeish, N.~Jain, et al. Scaling up test-time compute with latent reasoning: A recurrent depth approach. NeurIPS, 2025.
-\bibitem{goyal2024pause} S.~Goyal, Z.~Ji, A.~S.~Rawat, et al. Think before you speak: Training language models with pause tokens. ICLR, 2024.
+\bibitem{goyal2024pause} S.~Goyal, Z.~Ji, A.~S.~Rawat, A.~K.~Menon, S.~Kumar, V.~Nagarajan. Think before you speak: Training language models with pause tokens. ICLR, 2024.
 \bibitem{graves2016act} A.~Graves. Adaptive computation time for recurrent neural networks. arXiv:1603.08983, 2016.
-\bibitem{grazzi2025negative} R.~Grazzi, J.~Siems, A.~Zela, et al. Unlocking state-tracking in linear RNNs through negative eigenvalues. ICLR, 2025.
+\bibitem{grazzi2025negative} R.~Grazzi, J.~Siems, A.~Zela, J.~K.~H.~Franke, F.~Hutter, M.~Pontil. Unlocking state-tracking in linear RNNs through negative eigenvalues. ICLR, 2025.
 \bibitem{gu2022s4} A.~Gu, K.~Goel, C.~R\'e. Efficiently modeling long sequences with structured state spaces. ICLR, 2022.
-\bibitem{gu2023mamba} A.~Gu, T.~Dao. Mamba: Linear-time sequence modeling with selective state spaces. arXiv:2312.00752, 2023.
-\bibitem{hao2024coconut} S.~Hao, S.~Sukhbaatar, D.~Su, et al. Training large language models to reason in a continuous latent space. arXiv:2412.06769, 2024.
-\bibitem{jolicoeur2025trm} A.~Jolicoeur-Martineau. Less is more: Recursive reasoning with tiny networks. arXiv preprint, 2025.
+\bibitem{gu2023mamba} A.~Gu, T.~Dao. Mamba: Linear-time sequence modeling with selective state spaces. COLM, 2024. arXiv:2312.00752.
+\bibitem{hao2024coconut} S.~Hao, S.~Sukhbaatar, D.~Su, et al. Training large language models to reason in a continuous latent space. COLM, 2025. arXiv:2412.06769.
+\bibitem{jolicoeur2025trm} A.~Jolicoeur-Martineau. Less is more: Recursive reasoning with tiny networks. arXiv:2510.04871, 2025.
 \bibitem{kojima2022zeroshot} T.~Kojima, S.~S.~Gu, M.~Reid, Y.~Matsuo, Y.~Iwasawa. Large language models are zero-shot reasoners. NeurIPS, 2022.
 \bibitem{lieber2024jamba} O.~Lieber, B.~Lenz, H.~Bata, et al. Jamba: A hybrid Transformer-Mamba language model. arXiv:2403.19887, 2024.
 \bibitem{loshchilov2019adamw} I.~Loshchilov, F.~Hutter. Decoupled weight decay regularization. ICLR, 2019.
@@ -716,18 +716,18 @@ The results also mark the limits of the current evidence. Halting finds a good b
 \bibitem{merrill2024illusion} W.~Merrill, J.~Petty, A.~Sabharwal. The illusion of state in state-space models. ICML, 2024.
 \bibitem{micikevicius2018mixed} P.~Micikevicius, S.~Narang, J.~Alben, et al. Mixed precision training. ICLR, 2018.
 \bibitem{nye2021scratchpad} M.~Nye, A.~J.~Andreassen, G.~Gur-Ari, et al. Show your work: Scratchpads for intermediate computation with language models. arXiv:2112.00114, 2021.
-\bibitem{pfau2024dots} J.~Pfau, W.~Merrill, S.~R.~Bowman. Let's think dot by dot: Hidden computation in transformer language models. arXiv:2404.15758, 2024.
+\bibitem{pfau2024dots} J.~Pfau, W.~Merrill, S.~R.~Bowman. Let's think dot by dot: Hidden computation in transformer language models. COLM, 2024. arXiv:2404.15758.
 \bibitem{radford2019gpt2} A.~Radford, J.~Wu, R.~Child, D.~Luan, D.~Amodei, I.~Sutskever. Language models are unsupervised multitask learners. OpenAI technical report, 2019.
 \bibitem{saparov2023prontoqa} A.~Saparov, H.~He. Language models are greedy reasoners: A systematic formal analysis of chain-of-thought. ICLR, 2023.
 \bibitem{schwarzschild2021easyhard} A.~Schwarzschild, E.~Borgnia, A.~Gupta, F.~Huang, U.~Vishkin, M.~Goldblum, T.~Goldstein. Can you learn an algorithm? Generalizing from easy to hard problems with recurrent networks. NeurIPS, 2021.
 \bibitem{shazeer2019mqa} N.~Shazeer. Fast transformer decoding: One write-head is all you need. arXiv:1911.02150, 2019.
-\bibitem{tur2026rdvla} Y.~Tur, et al. Recurrent-Depth VLA: Implicit test-time compute scaling of VLA models via latent iterative reasoning. arXiv:2602.07845, 2026.
+\bibitem{tur2026rdvla} Y.~Tur, J.~Naghiyev, H.~Fang, et al. Recurrent-Depth VLA: Implicit test-time compute scaling of vision-language-action models via latent iterative reasoning. arXiv:2602.07845, 2026.
 \bibitem{vaswani2017attention} A.~Vaswani, N.~Shazeer, N.~Parmar, et al. Attention is all you need. NeurIPS, 2017.
 \bibitem{waleffe2024mambastudy} R.~Waleffe, W.~Byeon, D.~Riach, et al. An empirical study of Mamba-based language models. arXiv:2406.07887, 2024.
-\bibitem{wang2026trmmamba} W.~Wang, F.~Reid. Tiny recursive reasoning with Mamba-2 attention hybrid. arXiv:2602.12078, 2026.
+\bibitem{wang2026trmmamba} W.~Wang, F.~Reid. Tiny recursive reasoning with Mamba-2 attention hybrid. ICLR 2026 Workshop on Latent \& Implicit Thinking. arXiv:2602.12078, 2026.
 \bibitem{wei2022cot} J.~Wei, X.~Wang, D.~Schuurmans, et al. Chain-of-thought prompting elicits reasoning in large language models. NeurIPS, 2022.
 \bibitem{zhang2019rmsnorm} B.~Zhang, R.~Sennrich. Root mean square layer normalization. NeurIPS, 2019.
-\bibitem{zhu2025survey} R.-J.~Zhu, et al. A survey on latent reasoning. arXiv:2507.06203, 2025.
+\bibitem{zhu2025survey} R.-J.~Zhu, T.~Peng, T.~Cheng, et al. A survey on latent reasoning. arXiv:2507.06203, 2025.
 \end{thebibliography}
 
 \end{document}

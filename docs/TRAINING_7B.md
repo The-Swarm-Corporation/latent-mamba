@@ -68,7 +68,7 @@ The 1.3B stage starts from [`state-spaces/mamba2-1.3b`](https://huggingface.co/s
 | Added by Latent Mamba | thought projector + halting head, ~0.2% | ~0.1% |
 | Training context | 4,096 | 4,096 |
 
-**Pure or hybrid.** NVIDIA's 8B study found pure Mamba-2 lags Transformers on in-context recall and 5-shot MMLU, while a hybrid with about 7% attention layers beats both. A hybrid is the stronger base model, but thoughts must then be kept out of the attention layers' KV cache, or the constant-memory property is lost. This plan stays pure Mamba-2, consistent with the paper; a hybrid is a separate follow-up (Section 12).
+**Pure or hybrid.** NVIDIA's 8B study found pure Mamba-2 lags Transformers on copying and in-context learning (e.g. 5-shot MMLU, Phonebook), while a hybrid with about 7% attention layers (4 of 56; 43% Mamba-2, 50% MLP) exceeds the Transformer on all 12 standard tasks they evaluated. A hybrid is the stronger base model, but thoughts must then be kept out of the attention layers' KV cache, or the constant-memory property is lost. This plan stays pure Mamba-2, consistent with the paper; a hybrid is a separate follow-up (Section 12).
 
 ## 5. Latent pretraining objective
 
