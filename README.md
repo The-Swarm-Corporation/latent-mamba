@@ -38,7 +38,7 @@ Uses [uv](https://docs.astral.sh/uv/) with a locked environment (`uv.lock`). Req
 
 ```python
 import torch
-from latent_mamba.main import LatentMamba, LatentMambaConfig
+from latent_mamba import LatentMamba, LatentMambaConfig
 
 config = LatentMambaConfig(
     vocab_size = 1000,
@@ -142,7 +142,7 @@ $ uv run latent_mamba/main.py
 This runs `self_test()`, which checks that the chunked scan matches the exact recurrence, that prefill + cached decoding matches a single full pass, that state size is independent of thought count, that gradients reach both the thought projector and halting head, and that left padding is exact. It then runs `run_demo()`, which trains a tiny model through the full recipe (language CoT, Coconut curriculum, PonderNet halting) on k-hop pointer chasing and reports accuracy and thoughts used per hop count, against fixed-budget, no-thought and zero-ablated baselines.
 
 ```python
-from latent_mamba.main import self_test, run_demo
+from latent_mamba import self_test, run_demo
 
 self_test(device = 'cpu')
 model = run_demo(steps_per_stage = 600, ponder_steps = 800, device = 'cuda')
@@ -158,36 +158,135 @@ The demo is a smoke test of the pipeline, not a benchmark. Real benchmark result
 | Paper | [docs/paper.pdf](docs/paper.pdf) · LaTeX source [docs/latent_mamba.tex](docs/latent_mamba.tex) |
 | Model | [latent_mamba/main.py](latent_mamba/main.py) |
 | Training & evaluation | [latent_mamba/train.py](latent_mamba/train.py) · [scripts/run_pipeline.sh](scripts/run_pipeline.sh) · [Dockerfile](Dockerfile) |
+| Chat | [latent_mamba/chat.py](latent_mamba/chat.py) |
 | Environment | [pyproject.toml](pyproject.toml) · [uv.lock](uv.lock) |
 | Guides | [docs/RUNPOD.md](docs/RUNPOD.md) (GPUs, RunPod) · [docs/architecture.md](docs/architecture.md) (design notes) |
 | Checkpoints | [huggingface.co/kye/latent-mamba](https://huggingface.co/kye/latent-mamba) |
 | Training logs | [wandb.ai/apacai/latent-mamba](https://wandb.ai/apacai/latent-mamba) |
 
 
-## Training on reasoning benchmarks
+## Training
 
-[`latent_mamba/train.py`](latent_mamba/train.py) fine-tunes pretrained Mamba-2 (`state-spaces/mamba2-130m`, `-370m`, ...) on Coconut's GSM8k-Aug, ProsQA and ProntoQA with the full recipe. It compares against the same Mamba with no CoT, with written CoT, and against a Coconut GPT-2 of matched size, then benchmarks memory and latency against thinking budget. Runs log to [Weights & Biases](https://wandb.ai/apacai/latent-mamba) and upload to [kye/latent-mamba](https://huggingface.co/kye/latent-mamba).
+[`latent_mamba/train.py`](latent_mamba/train.py) fine-tunes pretrained Mamba-2 (`state-spaces/mamba2-130m`, `-370m`, `-780m`, `-1.3b`, `-2.7b`) on Coconut's GSM8k-Aug, ProsQA and ProntoQA with the full recipe: language CoT, the Coconut curriculum, then learning to halt. It also trains the baselines (the same Mamba with no CoT and with written CoT, and a Coconut GPT-2 of matched size), evaluates on the test set and benchmarks memory and latency against thinking budget.
+
+Install the training dependencies and download the data
 
 ```bash
 $ uv sync --extra train
-$ uv run latent_mamba/train.py data --dataset gsm8k prosqa
-$ uv run torchrun --nproc_per_node 4 latent_mamba/train.py train --model mamba2-130m --dataset prosqa --method latent --wandb
-$ uv run latent_mamba/train.py eval --ckpt runs/prosqa-mamba2-130m-latent/ponder.pt
+$ uv run latent_mamba/train.py data --dataset prosqa gsm8k
 ```
 
-[`scripts/run_pipeline.sh`](scripts/run_pipeline.sh) runs everything for one model and dataset (`uv run --extra train bash scripts/run_pipeline.sh`), and the [`Dockerfile`](Dockerfile) wraps it. See [docs/RUNPOD.md](docs/RUNPOD.md) for GPUs and step-by-step instructions.
+Train Latent Mamba on ProsQA on one GPU (about 14 hours for 130M on an H100)
+
+```bash
+$ uv run latent_mamba/train.py train \
+    --model mamba2-130m \
+    --dataset prosqa \
+    --method latent \
+    --no-hf-upload
+```
+
+The baselines use the same command with `--method cot` (written chain of thought) or `--method nocot` (answer directly). `--model gpt2` trains the Coconut Transformer baseline.
+
+Quick smoke test on a laptop, a tiny randomly initialised model on a slice of the data (seconds)
+
+```bash
+$ uv run latent_mamba/train.py train --model tiny-mamba --dataset prosqa --method latent \
+    --max-train-examples 64 --max-val-examples 8 \
+    --cot-epochs 1 --epochs-per-stage 1 --final-epochs 1 --ponder-epochs 1 \
+    --no-hf-upload
+```
+
+Several GPUs, with Weights & Biases logging
+
+```bash
+$ uv run torchrun --nproc_per_node 4 latent_mamba/train.py train \
+    --model mamba2-370m --dataset prosqa --method latent --wandb
+```
+
+GSM8k, where the latent curriculum starts from the written-CoT checkpoint, as in Coconut
+
+```bash
+$ uv run latent_mamba/train.py train --model mamba2-130m --dataset gsm8k --method cot
+$ uv run latent_mamba/train.py train --model mamba2-130m --dataset gsm8k --method latent \
+    --init-from runs/gsm8k-mamba2-130m-cot/cot.pt --start-stage 1
+```
+
+Evaluate a checkpoint on the test set (every halting rule, the thought ablations and a 0 to 12 thought sweep), and benchmark memory and latency
+
+```bash
+$ uv run latent_mamba/train.py eval --ckpt runs/prosqa-mamba2-130m-latent/ponder.pt --no-hf-upload
+$ uv run latent_mamba/train.py bench --models mamba2-130m gpt2
+```
+
+Checkpoints go to `runs/{dataset}-{model}-{method}/`, one per phase (`cot.pt`, `stage1.pt` ... `final.pt`, `ponder.pt`), each the best validation epoch of that phase. Runs resume from where they stopped. By default results also upload to [kye/latent-mamba](https://huggingface.co/kye/latent-mamba), which needs a write token (`hf auth login`); `--no-hf-upload` turns that off.
+
+Useful flags
+
+- `--batch-size 16 --grad-accum 2` if a GPU runs out of memory
+- `--wandb` logs to [Weights & Biases](https://wandb.ai/apacai/latent-mamba)
+- on CUDA the fused `mamba_ssm` scan is used automatically when installed (`pip install mamba-ssm --no-build-isolation`); `--no-fused-scan` turns it off
+- `uv run latent_mamba/train.py train --help` lists everything
+
+[`scripts/run_pipeline.sh`](scripts/run_pipeline.sh) runs the whole thing for one model and dataset (data, the three runs, test evaluation, benchmark, upload), and the [`Dockerfile`](Dockerfile) wraps it.
+
+```bash
+$ MODEL=mamba2-130m DATASET=prosqa WORKDIR=$PWD uv run bash scripts/run_pipeline.sh
+```
+
+See [docs/RUNPOD.md](docs/RUNPOD.md) for GPU choices and step-by-step cloud instructions.
+
+## Chat
+
+[`latent_mamba/chat.py`](latent_mamba/chat.py) loads the trained model from [Hugging Face](https://huggingface.co/kye/latent-mamba) (642 MiB, downloaded once) and answers questions in the terminal, showing how many thoughts it took.
+
+```bash
+$ uv run --extra train latent_mamba/chat.py
+```
+
+```
+Latent Mamba  mamba2-130m, phase ponder, on mps
+thoughts: at most 6  |  halting: learned (stop at 50%)  |  trace: off  |  ablation: off
+
+> Every grimpus is a jelpus. Every jelpus is a shumpus. Bob is a storpus. Every storpus is a grimpus. Tom is a bompus. Every bompus is a gerpus. Is Bob a shumpus or gerpus?
+Bob is a shumpus.
+3 thoughts, 0.31s
+```
+
+The model was trained only on ProsQA, so it answers questions of that form: a list of "every X is a Y" facts, then "Is <name> a <X> or <Y>?". Anything else gets a ProsQA-shaped answer.
+
+| Command | Effect |
+|---|---|
+| `/example` | ask a random ProsQA test question and grade the answer (needs `data/prosqa_test.json`) |
+| `/trace on` | print every thought: its halting probability and the tokens it is closest to |
+| `/thoughts N` | maximum number of thoughts (exactly N with the fixed rule) |
+| `/halt learned`, `/halt fixed`, `/halt convergence` | how the model decides to stop thinking |
+| `/ablate zeros`, `/ablate noise`, `/ablate off` | replace what the thoughts contain |
+| `/settings`, `/help`, `/quit` | |
+
+```bash
+$ uv run --extra train latent_mamba/chat.py --trace                       # trace from the start
+$ uv run --extra train latent_mamba/chat.py --question "..."              # answer one question and exit
+$ uv run --extra train latent_mamba/chat.py --ckpt prosqa-mamba2-130m-cot/cot.pt   # any checkpoint in the repo, or a local path
+```
+
+It picks CUDA, then Apple's GPU, then the CPU. On the CPU it works but takes several seconds per question.
 
 ## Results
 
-ProsQA, Mamba-2 130M fine-tuned from the pretrained checkpoint on one H100, validation accuracy (300 questions, chance 50%). Details in Section 6 of the [paper](docs/paper.pdf).
+ProsQA test set (500 questions, chance 50%), Mamba-2 130M fine-tuned from the pretrained checkpoint on one H100, one seed. Details in Section 6 of the [paper](docs/paper.pdf).
 
-| Model | Thoughts | Written reasoning | Val. accuracy |
-|---|---|---|---|
-| No CoT | 0 | none | 80.0% |
-| Written CoT | 0 | all steps | 74.3% |
-| **Latent Mamba** (final stage) | **6** | **none** | **98.7%** |
+| Model | Thoughts | Test accuracy |
+|---|---|---|
+| No CoT | 0 | 74.6% |
+| Written CoT | 0 | 70.8% |
+| **Latent Mamba**, learned halting | **3.1 (mean)** | **98.6%** |
+| **Latent Mamba**, fixed budget | **6** | **99.0%** |
+| ablation: no thoughts | 0 | 73.6% |
+| ablation: thoughts set to zero | 6 | 76.8% |
+| ablation: thoughts replaced by noise | 6 | 75.8% |
 
-These are validation results from a single run. Test-set accuracy, thought ablations, learned halting, the Coconut GPT-2 baseline and measured memory are still running.
+Removing or scrambling the thoughts drops accuracy back to the baseline, so the content of the thoughts carries the reasoning. Learned halting uses half the thoughts for 0.4 points, matching a fixed budget of three, but adapts only weakly to question difficulty. The recurrent state stayed at 18.2 MiB for budgets up to 4,096 thoughts.
 
 
 ## Citations
