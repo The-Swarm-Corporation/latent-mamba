@@ -152,6 +152,7 @@ The demo is a smoke test of the pipeline, not a benchmark. Real benchmark result
 
 ## Links
 
+| Resource | Link |
 |---|---|
 | Paper | [docs/paper.pdf](docs/paper.pdf) · LaTeX source [docs/latent_mamba.tex](docs/latent_mamba.tex) |
 | Model | [latent_mamba/main.py](latent_mamba/main.py) |
@@ -186,14 +187,6 @@ ProsQA, Mamba-2 130M fine-tuned from the pretrained checkpoint on one H100, vali
 
 These are validation results from a single run. Test-set accuracy, thought ablations, learned halting, the Coconut GPT-2 baseline and measured memory are still running.
 
-## Todo
-
-- [x] load pretrained Mamba-2 weights (the parameter names already match)
-- [ ] run the proposed evaluation (H1 - H3) on pointer chasing
-- [x] ProsQA following the Coconut settings (validation: 98.7% latent vs 74.3% written CoT vs 80.0% no CoT)
-- [ ] ProsQA test set, thought ablations and learned halting
-- [ ] ProntoQA and GSM8k
-- [ ] memory and latency comparison against a Coconut Transformer of matched size (`latent_mamba/train.py bench`)
 
 ## Citations
 
