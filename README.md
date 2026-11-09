@@ -148,12 +148,25 @@ model = run_demo(steps_per_stage = 600, ponder_steps = 800, device = 'cuda')
 
 The demo is a smoke test of the pipeline, not a benchmark. The paper does not report trained-model results yet; see Section 6 for the proposed evaluation protocol.
 
+## Training on reasoning benchmarks
+
+`train.py` fine-tunes pretrained Mamba-2 (`state-spaces/mamba2-130m`, `-370m`, ...) on Coconut's GSM8k-Aug, ProsQA and ProntoQA with the full recipe. It compares against the same Mamba with no CoT, with written CoT, and against a Coconut GPT-2 of matched size, then benchmarks memory and latency against thinking budget. Runs log to Weights & Biases and upload to [kye/latent-mamba](https://huggingface.co/kye/latent-mamba).
+
+```bash
+$ pip install -r requirements.txt
+$ python train.py data --dataset gsm8k prosqa
+$ torchrun --nproc_per_node 4 train.py train --model mamba2-130m --dataset prosqa --method latent --wandb
+$ python train.py eval --ckpt runs/prosqa-mamba2-130m-latent/ponder.pt
+```
+
+`scripts/run_pipeline.sh` runs everything for one model and dataset, and the `Dockerfile` wraps it. See [RUNPOD.md](RUNPOD.md) for GPUs and step-by-step instructions.
+
 ## Todo
 
-- [ ] load pretrained Mamba-2 weights (mostly a key rename, then `thought_projector.match_embedding_scale`)
+- [x] load pretrained Mamba-2 weights (the parameter names already match)
 - [ ] run the proposed evaluation (H1 - H3) on pointer chasing
-- [ ] GSM8K and ProsQA following the Coconut settings
-- [ ] memory and latency comparison against a Coconut Transformer of matched size
+- [ ] GSM8K, ProsQA and ProntoQA following the Coconut settings (`train.py`, ready to run)
+- [ ] memory and latency comparison against a Coconut Transformer of matched size (`train.py bench`)
 
 ## Citations
 

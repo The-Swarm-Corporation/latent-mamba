@@ -250,3 +250,6 @@ runs/
 lightning_logs/
 outputs/
 mlruns/
+
+# Datasets downloaded by train.py
+data/

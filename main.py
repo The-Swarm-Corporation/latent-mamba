@@ -51,8 +51,9 @@ Implementation notes
   depthwise causal conv over xBC, per-head A/dt/D, gated RMSNorm). Porting
   pretrained Mamba-2 weights is mostly a matter of renaming keys (not
   included here).
-* Prompts within a batch must have equal length. Left padding would push pad
-  tokens through the recurrent state, so group prompts by length instead.
+* Prompts of different lengths are batched with left padding plus a
+  ``prompt_mask`` (True for real tokens). Pad positions get dt = 0 and a zero
+  conv input, so they leave the state exactly as if they were absent.
 
 Quick start
 -----------
@@ -180,7 +181,9 @@ class LatentMambaConfig:
 
     def __post_init__(self) -> None:
         if self.d_inner % self.headdim != 0:
-            raise ValueError(f"d_inner={self.d_inner} must be divisible by headdim={self.headdim}")
+            raise ValueError(
+                f"d_inner={self.d_inner} must be divisible by headdim={self.headdim}"
+            )
         if self.d_conv < 2:
             raise ValueError("d_conv must be >= 2")
         if not 0.0 < self.halt_prior < 1.0:
@@ -225,7 +228,9 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor, gate: Tensor | None = None) -> Tensor:
         if gate is not None:
             x = x * F.silu(gate)
-        compute_dtype = torch.promote_types(x.dtype, torch.float32)  # upcast half precision only
+        compute_dtype = torch.promote_types(
+            x.dtype, torch.float32
+        )  # upcast half precision only
         x_f = x.to(compute_dtype)
         x_f = x_f * torch.rsqrt(x_f.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         return (x_f * self.weight.to(compute_dtype)).to(x.dtype)
@@ -257,9 +262,20 @@ class LayerState:
         dtype: torch.dtype = torch.float32,
     ) -> LayerState:
         return cls(
-            conv=torch.zeros(batch_size, config.conv_dim, config.d_conv - 1, device=device, dtype=dtype),
+            conv=torch.zeros(
+                batch_size,
+                config.conv_dim,
+                config.d_conv - 1,
+                device=device,
+                dtype=dtype,
+            ),
             ssm=torch.zeros(
-                batch_size, config.n_heads, config.headdim, config.d_state, device=device, dtype=dtype
+                batch_size,
+                config.n_heads,
+                config.headdim,
+                config.d_state,
+                device=device,
+                dtype=dtype,
             ),
         )
 
@@ -283,7 +299,12 @@ class MambaCache:
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
     ) -> MambaCache:
-        return cls([LayerState.zeros(config, batch_size, device, dtype) for _ in range(config.n_layers)])
+        return cls(
+            [
+                LayerState.zeros(config, batch_size, device, dtype)
+                for _ in range(config.n_layers)
+            ]
+        )
 
     @property
     def batch_size(self) -> int:
@@ -317,11 +338,17 @@ class MambaCache:
 
     def detach(self) -> MambaCache:
         """Cut the autograd graph (for truncated backprop through long loops)."""
-        return MambaCache([LayerState(s.conv.detach(), s.ssm.detach()) for s in self.layers])
+        return MambaCache(
+            [LayerState(s.conv.detach(), s.ssm.detach()) for s in self.layers]
+        )
 
     def num_bytes(self) -> int:
         """Memory held by the cache. Constant in sequence and thought length."""
-        return sum(s.conv.numel() * s.conv.element_size() + s.ssm.numel() * s.ssm.element_size() for s in self.layers)
+        return sum(
+            s.conv.numel() * s.conv.element_size()
+            + s.ssm.numel() * s.ssm.element_size()
+            for s in self.layers
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -337,7 +364,9 @@ def _segsum(x: Tensor) -> Tensor:
     """
     t = x.size(-1)
     x = x.unsqueeze(-1).expand(*x.shape, t)
-    strict = torch.tril(torch.ones(t, t, dtype=torch.bool, device=x.device), diagonal=-1)
+    strict = torch.tril(
+        torch.ones(t, t, dtype=torch.bool, device=x.device), diagonal=-1
+    )
     x = x.masked_fill(~strict, 0.0)
     out = torch.cumsum(x, dim=-2)
     causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=x.device), diagonal=0)
@@ -393,7 +422,9 @@ def ssd_chunked_scan(
     xs = xs.reshape(bsz, n_chunks, chunk, n_heads, headdim)
     bs = bs.reshape(bsz, n_chunks, chunk, n_heads, d_state)
     cs = cs.reshape(bsz, n_chunks, chunk, n_heads, d_state)
-    a_dt = a_dt.reshape(bsz, n_chunks, chunk, n_heads).permute(0, 3, 1, 2)  # (b, h, c, l)
+    a_dt = a_dt.reshape(bsz, n_chunks, chunk, n_heads).permute(
+        0, 3, 1, 2
+    )  # (b, h, c, l)
     a_cumsum = torch.cumsum(a_dt, dim=-1)
 
     # 1. Intra-chunk outputs (diagonal blocks).
@@ -417,7 +448,9 @@ def ssd_chunked_scan(
     return y, final_state
 
 
-def ssd_step(x: Tensor, dt: Tensor, a: Tensor, b: Tensor, c: Tensor, state: Tensor) -> tuple[Tensor, Tensor]:
+def ssd_step(
+    x: Tensor, dt: Tensor, a: Tensor, b: Tensor, c: Tensor, state: Tensor
+) -> tuple[Tensor, Tensor]:
     """Exact single-token recurrence, equivalent to ``ssd_chunked_scan`` with L=1.
 
     Args:
@@ -446,9 +479,15 @@ def ssd_step(x: Tensor, dt: Tensor, a: Tensor, b: Tensor, c: Tensor, state: Tens
 class Mamba2Mixer(nn.Module):
     """Mamba-2 token mixer with explicit, functional state handling.
 
-    ``forward(u, state)`` processes ``u`` (B, L, d_model) starting from
+    ``forward(u, state, mask)`` processes ``u`` (B, L, d_model) starting from
     ``state``. It returns ``(out, new_state)``. L can be any length, including
     1 (a single thought step).
+
+    ``mask`` (B, L), True for real positions, supports left padding from the
+    zero state: masked positions get a zero conv input and dt = 0, so they
+    neither decay nor write the SSM state, and the conv window they leave
+    behind is all zeros, the same as the initial state. Outputs at masked
+    positions are meaningless.
     """
 
     def __init__(self, config: LatentMambaConfig) -> None:
@@ -457,14 +496,21 @@ class Mamba2Mixer(nn.Module):
         d_in_proj = 2 * config.d_inner + 2 * config.d_state + config.n_heads
         self.in_proj = nn.Linear(config.d_model, d_in_proj, bias=False)
         self.conv1d = nn.Conv1d(
-            config.conv_dim, config.conv_dim, kernel_size=config.d_conv, groups=config.conv_dim, bias=True
+            config.conv_dim,
+            config.conv_dim,
+            kernel_size=config.d_conv,
+            groups=config.conv_dim,
+            bias=True,
         )
 
         dt = torch.exp(
-            torch.rand(config.n_heads) * (math.log(config.dt_max) - math.log(config.dt_min))
+            torch.rand(config.n_heads)
+            * (math.log(config.dt_max) - math.log(config.dt_min))
             + math.log(config.dt_min)
         ).clamp(min=config.dt_init_floor)
-        self.dt_bias = nn.Parameter(dt + torch.log(-torch.expm1(-dt)))  # inverse softplus
+        self.dt_bias = nn.Parameter(
+            dt + torch.log(-torch.expm1(-dt))
+        )  # inverse softplus
         a = torch.empty(config.n_heads).uniform_(*config.a_init_range)
         self.A_log = nn.Parameter(torch.log(a))
         self.D = nn.Parameter(torch.ones(config.n_heads))
@@ -472,23 +518,36 @@ class Mamba2Mixer(nn.Module):
         self.norm = RMSNorm(config.d_inner, eps=config.norm_eps)
         self.out_proj = nn.Linear(config.d_inner, config.d_model, bias=False)
 
-    def forward(self, u: Tensor, state: LayerState | None = None) -> tuple[Tensor, LayerState]:
+    def forward(
+        self, u: Tensor, state: LayerState | None = None, mask: Tensor | None = None
+    ) -> tuple[Tensor, LayerState]:
         cfg = self.config
         bsz, seqlen, _ = u.shape
         if state is None:
             state = LayerState.zeros(cfg, bsz, u.device, u.dtype)
 
-        z, xbc, dt = torch.split(self.in_proj(u), [cfg.d_inner, cfg.conv_dim, cfg.n_heads], dim=-1)
+        z, xbc, dt = torch.split(
+            self.in_proj(u), [cfg.d_inner, cfg.conv_dim, cfg.n_heads], dim=-1
+        )
+        keep = None if mask is None else mask.to(xbc.dtype).unsqueeze(-1)  # (B, L, 1)
+        if keep is not None:
+            xbc = xbc * keep
 
         # Causal depthwise conv, continuing from the stored window.
-        window = torch.cat([state.conv, xbc.transpose(1, 2)], dim=-1)  # (B, C, d_conv - 1 + L)
+        window = torch.cat(
+            [state.conv, xbc.transpose(1, 2)], dim=-1
+        )  # (B, C, d_conv - 1 + L)
         new_conv = window[..., -(cfg.d_conv - 1) :]
-        xbc = F.conv1d(window, self.conv1d.weight, self.conv1d.bias, groups=cfg.conv_dim)
+        xbc = F.conv1d(
+            window, self.conv1d.weight, self.conv1d.bias, groups=cfg.conv_dim
+        )
         xbc = F.silu(xbc).transpose(1, 2)  # (B, L, C)
 
         x, b, c = torch.split(xbc, [cfg.d_inner, cfg.d_state, cfg.d_state], dim=-1)
         x = x.reshape(bsz, seqlen, cfg.n_heads, cfg.headdim)
         dt = F.softplus(dt + self.dt_bias)
+        if keep is not None:
+            dt = dt * keep.to(dt.dtype)
         a = -torch.exp(self.A_log)
 
         if seqlen == 1:
@@ -510,8 +569,10 @@ class ResidualBlock(nn.Module):
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
         self.mixer = Mamba2Mixer(config)
 
-    def forward(self, x: Tensor, state: LayerState | None = None) -> tuple[Tensor, LayerState]:
-        out, new_state = self.mixer(self.norm(x), state)
+    def forward(
+        self, x: Tensor, state: LayerState | None = None, mask: Tensor | None = None
+    ) -> tuple[Tensor, LayerState]:
+        out, new_state = self.mixer(self.norm(x), state, mask)
         return x + out, new_state
 
 
@@ -527,15 +588,24 @@ class MambaBackbone(nn.Module):
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         nn.init.normal_(self.embedding.weight, std=config.init_std)
-        self.layers = nn.ModuleList([ResidualBlock(config) for _ in range(config.n_layers)])
+        self.layers = nn.ModuleList(
+            [ResidualBlock(config) for _ in range(config.n_layers)]
+        )
         self.norm_f = RMSNorm(config.d_model, eps=config.norm_eps)
 
-    def forward(self, inputs_embeds: Tensor, cache: MambaCache | None = None) -> tuple[Tensor, MambaCache]:
+    def forward(
+        self,
+        inputs_embeds: Tensor,
+        cache: MambaCache | None = None,
+        mask: Tensor | None = None,
+    ) -> tuple[Tensor, MambaCache]:
         """Run the stack.
 
         Args:
             inputs_embeds: (B, L, d_model).
             cache: State to continue from. None starts from zeros.
+            mask: Optional (B, L) bool, True for real positions. Only left
+                padding from the zero state is exact (see :class:`Mamba2Mixer`).
 
         Returns:
             ``(hidden, new_cache)``: normalised final hidden states (B, L, d_model)
@@ -544,7 +614,7 @@ class MambaBackbone(nn.Module):
         h = inputs_embeds
         new_layers: list[LayerState] = []
         for i, layer in enumerate(self.layers):
-            h, layer_state = layer(h, None if cache is None else cache.layers[i])
+            h, layer_state = layer(h, None if cache is None else cache.layers[i], mask)
             new_layers.append(layer_state)
         return self.norm_f(h), MambaCache(new_layers)
 
@@ -604,7 +674,9 @@ class HaltingHead(nn.Module):
         self.fc1 = nn.Linear(config.d_model, hidden)
         self.fc2 = nn.Linear(hidden, 1)
         nn.init.zeros_(self.fc2.weight)
-        nn.init.constant_(self.fc2.bias, math.log(config.halt_prior / (1.0 - config.halt_prior)))
+        nn.init.constant_(
+            self.fc2.bias, math.log(config.halt_prior / (1.0 - config.halt_prior))
+        )
 
     def forward(self, h: Tensor) -> Tensor:
         """Map (B, d_model) to halting logits (B,)."""
@@ -697,13 +769,25 @@ class LatentMamba(nn.Module):
         """Token embeddings, shape (B, L, d_model)."""
         return self.backbone.embedding(input_ids)
 
-    def forward(self, input_ids: Tensor, cache: MambaCache | None = None) -> tuple[Tensor, MambaCache]:
+    def forward(
+        self,
+        input_ids: Tensor,
+        cache: MambaCache | None = None,
+        mask: Tensor | None = None,
+    ) -> tuple[Tensor, MambaCache]:
         """Plain language-mode pass that returns ``(logits (B, L, V), cache)``."""
-        hidden, cache = self.backbone(self.embed(input_ids), cache)
+        hidden, cache = self.backbone(self.embed(input_ids), cache, mask)
         return self.lm_head(hidden), cache
 
-    def encode_prompt(self, prompt_ids: Tensor) -> tuple[Tensor, MambaCache]:
+    def encode_prompt(
+        self, prompt_ids: Tensor, prompt_mask: Tensor | None = None
+    ) -> tuple[Tensor, MambaCache]:
         """Prefill a prompt that ends with <bot>.
+
+        Args:
+            prompt_ids: (B, Lp), each row ending with <bot>.
+            prompt_mask: Optional (B, Lp) bool for left-padded batches, True
+                for real tokens. Padding must come before the first real token.
 
         Returns:
             ``(h, cache)``: the final hidden state at <bot> (B, d_model), which
@@ -711,7 +795,13 @@ class LatentMamba(nn.Module):
         """
         if not bool((prompt_ids[:, -1] == self.config.bot_id).all()):
             raise ValueError("every prompt must end with bot_id")
-        hidden, cache = self.backbone(self.embed(prompt_ids))
+        if prompt_mask is not None:
+            m = prompt_mask.bool().long()
+            if not bool(m[:, -1].all()) or bool((m[:, 1:] < m[:, :-1]).any()):
+                raise ValueError(
+                    "prompt_mask must describe left padding (pads only before real tokens)"
+                )
+        hidden, cache = self.backbone(self.embed(prompt_ids), mask=prompt_mask)
         return hidden[:, -1], cache
 
     def thought_step(
@@ -759,7 +849,9 @@ class LatentMamba(nn.Module):
         targets = input_ids[:, 1:].clone()
         if loss_mask is not None:
             targets = targets.masked_fill(~loss_mask[:, 1:], IGNORE_INDEX)
-        return F.cross_entropy(logits.transpose(1, 2), targets, ignore_index=IGNORE_INDEX)
+        return F.cross_entropy(
+            logits.transpose(1, 2), targets, ignore_index=IGNORE_INDEX
+        )
 
     def _answer_inputs(self, target_ids: Tensor) -> Tensor:
         """Teacher-forcing inputs ``[<eot>, target_1 .. target_{T-1}]``, with padding mapped to pad_id."""
@@ -772,7 +864,10 @@ class LatentMamba(nn.Module):
         hidden, _ = self.backbone(self.embed(self._answer_inputs(target_ids)), cache)
         logits = self.lm_head(hidden)
         token_loss = F.cross_entropy(
-            logits.transpose(1, 2), target_ids, ignore_index=IGNORE_INDEX, reduction="none"
+            logits.transpose(1, 2),
+            target_ids,
+            ignore_index=IGNORE_INDEX,
+            reduction="none",
         )
         mask = (target_ids != IGNORE_INDEX).float()
         return (token_loss * mask).sum(1) / mask.sum(1).clamp(min=1.0)
@@ -788,7 +883,13 @@ class LatentMamba(nn.Module):
             cache = cache_new.where(active, cache)
         return h, cache
 
-    def latent_loss(self, prompt_ids: Tensor, target_ids: Tensor, n_thoughts: int | Tensor) -> LatentLossOutput:
+    def latent_loss(
+        self,
+        prompt_ids: Tensor,
+        target_ids: Tensor,
+        n_thoughts: int | Tensor,
+        prompt_mask: Tensor | None = None,
+    ) -> LatentLossOutput:
         """Coconut-curriculum loss with a fixed (per-example) number of thoughts.
 
         Args:
@@ -797,13 +898,20 @@ class LatentMamba(nn.Module):
                 padded with ``IGNORE_INDEX``.
             n_thoughts: Thoughts per example, as an int or a (B,) tensor. Zero
                 gives the language-CoT stage.
+            prompt_mask: Optional left-padding mask, see :meth:`encode_prompt`.
         """
-        h, cache = self.encode_prompt(prompt_ids)
-        n = torch.as_tensor(n_thoughts, device=prompt_ids.device).expand(prompt_ids.shape[0]).long()
+        h, cache = self.encode_prompt(prompt_ids, prompt_mask)
+        n = (
+            torch.as_tensor(n_thoughts, device=prompt_ids.device)
+            .expand(prompt_ids.shape[0])
+            .long()
+        )
         h, cache = self._run_thoughts(h, cache, n)
         hidden, _ = self.backbone(self.embed(self._answer_inputs(target_ids)), cache)
         logits = self.lm_head(hidden)
-        loss = F.cross_entropy(logits.transpose(1, 2), target_ids, ignore_index=IGNORE_INDEX)
+        loss = F.cross_entropy(
+            logits.transpose(1, 2), target_ids, ignore_index=IGNORE_INDEX
+        )
         return LatentLossOutput(loss=loss, n_thoughts=n)
 
     def ponder_loss(
@@ -813,6 +921,7 @@ class LatentMamba(nn.Module):
         max_thoughts: int,
         beta: float = 0.01,
         prior: float | None = None,
+        prompt_mask: Tensor | None = None,
     ) -> PonderLossOutput:
         """PonderNet objective for learning when to stop thinking.
 
@@ -828,13 +937,14 @@ class LatentMamba(nn.Module):
             max_thoughts: N, the maximum number of thoughts (>= 1).
             beta: Weight of the KL regulariser.
             prior: lambda_p of the geometric prior (defaults to config.halt_prior).
+            prompt_mask: Optional left-padding mask, see :meth:`encode_prompt`.
         """
         if max_thoughts < 1:
             raise ValueError("max_thoughts must be >= 1")
         prior = self.config.halt_prior if prior is None else prior
         bsz = prompt_ids.shape[0]
 
-        h, cache = self.encode_prompt(prompt_ids)
+        h, cache = self.encode_prompt(prompt_ids, prompt_mask)
         caches: list[MambaCache] = []
         lambdas: list[Tensor] = []
         for _ in range(max_thoughts):
@@ -843,13 +953,17 @@ class LatentMamba(nn.Module):
             lambdas.append(torch.sigmoid(halt_logit))
 
         # Score the answer from every step's state in one batched pass.
-        per_step = self._per_example_answer_loss(MambaCache.cat(caches), target_ids.repeat(max_thoughts, 1))
+        per_step = self._per_example_answer_loss(
+            MambaCache.cat(caches), target_ids.repeat(max_thoughts, 1)
+        )
         per_step = per_step.view(max_thoughts, bsz).transpose(0, 1)  # (B, N)
 
         lam = torch.stack(lambdas, dim=1)  # (B, N)
         lam = torch.cat([lam[:, :-1], torch.ones_like(lam[:, :1])], dim=1)
         log_continue = torch.log1p(-lam[:, :-1].clamp(max=1.0 - 1e-6))
-        log_survive = F.pad(torch.cumsum(log_continue, dim=1), (1, 0))  # log prod_{j<n} (1 - lambda_j)
+        log_survive = F.pad(
+            torch.cumsum(log_continue, dim=1), (1, 0)
+        )  # log prod_{j<n} (1 - lambda_j)
         p = lam * torch.exp(log_survive)
 
         steps = torch.arange(1, max_thoughts + 1, device=p.device, dtype=p.dtype)
@@ -881,6 +995,7 @@ class LatentMamba(nn.Module):
         ablate: Ablation | None = None,
         temperature: float = 0.0,
         eos_id: int | None = None,
+        prompt_mask: Tensor | None = None,
     ) -> GenerationOutput:
         """Think adaptively, then decode the answer.
 
@@ -906,12 +1021,13 @@ class LatentMamba(nn.Module):
             ablate: Optional thought ablation, see :meth:`thought_step`.
             temperature: 0 for greedy decoding, otherwise softmax sampling.
             eos_id: Optional end token. Finished rows then emit pad_id.
+            prompt_mask: Optional left-padding mask, see :meth:`encode_prompt`.
         """
         was_training = self.training
         self.eval()
         bsz, device = prompt_ids.shape[0], prompt_ids.device
 
-        h, cache = self.encode_prompt(prompt_ids)
+        h, cache = self.encode_prompt(prompt_ids, prompt_mask)
         halted = torch.zeros(bsz, dtype=torch.bool, device=device)
         n_used = torch.zeros(bsz, dtype=torch.long, device=device)
         survive = torch.ones(bsz, device=device, dtype=h.dtype)
@@ -926,24 +1042,32 @@ class LatentMamba(nn.Module):
             cache = cache_new.where(active, cache)
             n_used += active.long()
             if halt_rule == "learned":
-                survive = torch.where(active, survive * (1.0 - torch.sigmoid(halt_logit)), survive)
+                survive = torch.where(
+                    active, survive * (1.0 - torch.sigmoid(halt_logit)), survive
+                )
                 halted |= active & (1.0 - survive >= halt_threshold)
             elif halt_rule == "convergence":
                 halted |= active & (delta < convergence_tol)
             elif halt_rule != "fixed":
                 raise ValueError(f"unknown halt_rule {halt_rule!r}")
 
-        token = torch.full((bsz, 1), self.config.eot_id, dtype=torch.long, device=device)
+        token = torch.full(
+            (bsz, 1), self.config.eot_id, dtype=torch.long, device=device
+        )
         finished = torch.zeros(bsz, dtype=torch.bool, device=device)
         generated: list[Tensor] = []
         for _ in range(max_new_tokens):
             logits, cache = self(token, cache)
             logits = logits[:, -1]
             if temperature > 0:
-                next_token = torch.multinomial(torch.softmax(logits / temperature, dim=-1), 1).squeeze(-1)
+                next_token = torch.multinomial(
+                    torch.softmax(logits / temperature, dim=-1), 1
+                ).squeeze(-1)
             else:
                 next_token = logits.argmax(dim=-1)
-            next_token = torch.where(finished, torch.full_like(next_token, self.config.pad_id), next_token)
+            next_token = torch.where(
+                finished, torch.full_like(next_token, self.config.pad_id), next_token
+            )
             generated.append(next_token)
             if eos_id is not None:
                 finished |= next_token == eos_id
@@ -952,7 +1076,9 @@ class LatentMamba(nn.Module):
             token = next_token[:, None]
 
         self.train(was_training)
-        tokens = torch.stack(generated, dim=1) if generated else prompt_ids.new_zeros(bsz, 0)
+        tokens = (
+            torch.stack(generated, dim=1) if generated else prompt_ids.new_zeros(bsz, 0)
+        )
         return GenerationOutput(tokens=tokens, n_thoughts=n_used)
 
 
@@ -982,7 +1108,9 @@ class PointerChasingTask:
         self.vocab_size = n_symbols + 4 + max_hops
         self.rng = random.Random(seed)
 
-    def sample(self, batch_size: int, hops: int | None = None) -> tuple[Tensor, Tensor, Tensor]:
+    def sample(
+        self, batch_size: int, hops: int | None = None
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """Draw a batch.
 
         Returns:
@@ -1009,7 +1137,9 @@ class PointerChasingTask:
             hop_list.append(k)
         return torch.tensor(prompts), torch.tensor(chains), torch.tensor(hop_list)
 
-    def stage_targets(self, chains: Tensor, hops: Tensor, stage: int) -> tuple[Tensor, Tensor]:
+    def stage_targets(
+        self, chains: Tensor, hops: Tensor, stage: int
+    ) -> tuple[Tensor, Tensor]:
         """Coconut stage ``stage``: drop the first min(stage, k-1) CoT steps.
 
         Returns:
@@ -1033,25 +1163,40 @@ def self_test(device: str = "cpu", seed: int = 0) -> None:
     """Numerical and functional checks. Raises AssertionError on failure."""
     torch.manual_seed(seed)
     cfg = LatentMambaConfig(
-        vocab_size=50, bot_id=47, eot_id=48, pad_id=49,
-        d_model=64, n_layers=2, d_state=16, headdim=16, chunk_size=8,
+        vocab_size=50,
+        bot_id=47,
+        eot_id=48,
+        pad_id=49,
+        d_model=64,
+        n_layers=2,
+        d_state=16,
+        headdim=16,
+        chunk_size=8,
     )
     model = LatentMamba(cfg).to(device).double()
 
     # 1. Chunked scan (with padding and an initial state) matches the recurrence.
     bsz, seqlen = 3, 21
-    x = torch.randn(bsz, seqlen, cfg.n_heads, cfg.headdim, device=device, dtype=torch.double)
-    dt = F.softplus(torch.randn(bsz, seqlen, cfg.n_heads, device=device, dtype=torch.double))
+    x = torch.randn(
+        bsz, seqlen, cfg.n_heads, cfg.headdim, device=device, dtype=torch.double
+    )
+    dt = F.softplus(
+        torch.randn(bsz, seqlen, cfg.n_heads, device=device, dtype=torch.double)
+    )
     a = -torch.rand(cfg.n_heads, device=device, dtype=torch.double) * 2
     b = torch.randn(bsz, seqlen, cfg.d_state, device=device, dtype=torch.double)
     c = torch.randn(bsz, seqlen, cfg.d_state, device=device, dtype=torch.double)
-    h0 = torch.randn(bsz, cfg.n_heads, cfg.headdim, cfg.d_state, device=device, dtype=torch.double)
+    h0 = torch.randn(
+        bsz, cfg.n_heads, cfg.headdim, cfg.d_state, device=device, dtype=torch.double
+    )
     y_scan, h_scan = ssd_chunked_scan(x, dt, a, b, c, cfg.chunk_size, h0)
     state, ys = h0, []
     for t in range(seqlen):
         y_t, state = ssd_step(x[:, t], dt[:, t], a, b[:, t], c[:, t], state)
         ys.append(y_t)
-    assert torch.allclose(y_scan, torch.stack(ys, 1), atol=1e-9), "scan output != recurrence"
+    assert torch.allclose(
+        y_scan, torch.stack(ys, 1), atol=1e-9
+    ), "scan output != recurrence"
     assert torch.allclose(h_scan, state, atol=1e-9), "scan final state != recurrence"
 
     # 2. Prefill + token-by-token continuation matches one full forward pass.
@@ -1062,7 +1207,9 @@ def self_test(device: str = "cpu", seed: int = 0) -> None:
     for t in range(11, 19):
         lg, cache = model(ids[:, t : t + 1], cache)
         step_logits.append(lg)
-    assert torch.allclose(full_logits, torch.cat(step_logits, 1), atol=1e-8), "cached decoding mismatch"
+    assert torch.allclose(
+        full_logits, torch.cat(step_logits, 1), atol=1e-8
+    ), "cached decoding mismatch"
     size_before = cache.num_bytes()
 
     # 3. Thoughts leave the cache size unchanged and losses backpropagate.
@@ -1073,25 +1220,38 @@ def self_test(device: str = "cpu", seed: int = 0) -> None:
     h, cache = model.encode_prompt(prompt)
     for _ in range(5):
         h, cache, _ = model.thought_step(h, cache)
-    assert cache.num_bytes() == size_before * 2, "cache size should depend only on batch size"
+    assert (
+        cache.num_bytes() == size_before * 2
+    ), "cache size should depend only on batch size"
 
-    out = model.latent_loss(prompt, target, n_thoughts=torch.tensor([0, 1, 2, 3], device=device))
+    out = model.latent_loss(
+        prompt, target, n_thoughts=torch.tensor([0, 1, 2, 3], device=device)
+    )
     out.loss.backward()
     assert torch.isfinite(out.loss)
-    assert model.thought_projector.proj.weight.grad is not None, "no gradient through thoughts"
+    assert (
+        model.thought_projector.proj.weight.grad is not None
+    ), "no gradient through thoughts"
     model.zero_grad()
 
     pout = model.ponder_loss(prompt, target, max_thoughts=4)
     pout.loss.backward()
-    assert torch.allclose(pout.halting_distribution.sum(1), torch.ones(4, device=device, dtype=torch.double))
+    assert torch.allclose(
+        pout.halting_distribution.sum(1),
+        torch.ones(4, device=device, dtype=torch.double),
+    )
     assert model.halting_head.fc2.weight.grad is not None, "no gradient to halting head"
 
     # 4. Per-example thought counts: an example that stopped is frozen while others continue.
     h2, c2 = model.encode_prompt(prompt[:2])
     _, c_single, _ = model.thought_step(h2, c2)
     _, c_mixed = model._run_thoughts(h2, c2, torch.tensor([1, 3], device=device))
-    assert torch.allclose(c_mixed.layers[-1].ssm[0], c_single.layers[-1].ssm[0]), "stopped example changed"
-    assert not torch.allclose(c_mixed.layers[-1].ssm[1], c_single.layers[-1].ssm[1]), "active example frozen"
+    assert torch.allclose(
+        c_mixed.layers[-1].ssm[0], c_single.layers[-1].ssm[0]
+    ), "stopped example changed"
+    assert not torch.allclose(
+        c_mixed.layers[-1].ssm[1], c_single.layers[-1].ssm[1]
+    ), "active example frozen"
 
     # 5. Generation with every halting rule.
     for rule in ("learned", "convergence", "fixed"):
@@ -1099,7 +1259,27 @@ def self_test(device: str = "cpu", seed: int = 0) -> None:
         assert gen.tokens.shape == (4, 3) and int(gen.n_thoughts.max()) <= 4
     gen = model.generate(prompt, max_new_tokens=2, max_thoughts=3, ablate="zeros")
     assert gen.tokens.shape == (4, 2)
-    print("self-test passed: scan == recurrence, cached decoding exact, O(1) state, gradients OK")
+
+    # 6. Left padding with a mask is exact: a padded row matches the same prompt run alone.
+    short = prompt[:, 4:]  # (4, 6), still ends with <bot>
+    padded = torch.cat([torch.full_like(prompt[:, :4], cfg.pad_id), short], dim=1)
+    pmask = torch.ones_like(padded, dtype=torch.bool)
+    pmask[:, :4] = False
+    padded[1:], pmask[1:] = prompt[1:], True  # mixed batch: only row 0 is padded
+    h_pad, c_pad = model.encode_prompt(padded, pmask)
+    h_ref, c_ref = model.encode_prompt(short[:1])
+    assert torch.allclose(
+        h_pad[:1], h_ref, atol=1e-9
+    ), "left padding changed the hidden state"
+    for lp, lr in zip(c_pad.layers, c_ref.layers):
+        assert torch.allclose(lp.ssm[:1], lr.ssm, atol=1e-9) and torch.allclose(
+            lp.conv[:1], lr.conv, atol=1e-9
+        )
+    h_full, _ = model.encode_prompt(prompt[1:])
+    assert torch.allclose(h_pad[1:], h_full, atol=1e-9), "mask changed unpadded rows"
+    print(
+        "self-test passed: scan == recurrence, cached decoding exact, O(1) state, gradients OK, padding exact"
+    )
 
 
 def _accuracy_by_hops(
@@ -1140,16 +1320,29 @@ def run_demo(
     dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     task = PointerChasingTask(n_symbols=6, max_hops=3, seed=seed)
     cfg = LatentMambaConfig(
-        vocab_size=task.vocab_size, bot_id=task.bot_id, eot_id=task.eot_id, pad_id=task.pad_id,
-        d_model=128, n_layers=4, d_state=32, headdim=32, chunk_size=32,
+        vocab_size=task.vocab_size,
+        bot_id=task.bot_id,
+        eot_id=task.eot_id,
+        pad_id=task.pad_id,
+        d_model=128,
+        n_layers=4,
+        d_state=32,
+        headdim=32,
+        chunk_size=32,
     )
     model = LatentMamba(cfg).to(dev)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"device={dev}  params={n_params / 1e6:.2f}M  task: {task.max_hops}-hop pointer chasing, "
-          f"{task.n_symbols} symbols")
+    print(
+        f"device={dev}  params={n_params / 1e6:.2f}M  task: {task.max_hops}-hop pointer chasing, "
+        f"{task.n_symbols} symbols"
+    )
 
-    def train(label: str, steps: int, step_fn: Callable[[], tuple[Tensor, str]]) -> None:
-        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)  # reset per stage, as in Coconut
+    def train(
+        label: str, steps: int, step_fn: Callable[[], tuple[Tensor, str]]
+    ) -> None:
+        opt = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=0.01
+        )  # reset per stage, as in Coconut
         start = time.time()
         for step in range(1, steps + 1):
             loss, info = step_fn()
@@ -1158,15 +1351,20 @@ def run_demo(
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             if step % max(1, steps // 4) == 0 or step == steps:
-                print(f"  [{label}] step {step:4d}/{steps}  loss {loss.item():.3f}  {info}  "
-                      f"({time.time() - start:.0f}s)")
+                print(
+                    f"  [{label}] step {step:4d}/{steps}  loss {loss.item():.3f}  {info}  "
+                    f"({time.time() - start:.0f}s)"
+                )
 
     c = thoughts_per_step
     for stage in range(task.max_hops):
+
         def coconut_step(stage: int = stage) -> tuple[Tensor, str]:
             prompts, chains, hops = task.sample(batch_size)
             targets, removed = task.stage_targets(chains, hops, stage)
-            out = model.latent_loss(prompts.to(dev), targets.to(dev), (c * removed).to(dev))
+            out = model.latent_loss(
+                prompts.to(dev), targets.to(dev), (c * removed).to(dev)
+            )
             return out.loss, f"mean thoughts {out.n_thoughts.float().mean().item():.2f}"
 
         name = "language CoT" if stage == 0 else f"coconut stage {stage}"
@@ -1177,25 +1375,37 @@ def run_demo(
     def ponder_step() -> tuple[Tensor, str]:
         prompts, chains, hops = task.sample(batch_size)
         targets, _ = task.stage_targets(chains, hops, task.max_hops)
-        out = model.ponder_loss(prompts.to(dev), targets.to(dev), max_thoughts=max_thoughts, beta=0.01)
-        means = [out.expected_thoughts[hops.to(dev) == k].mean().item() for k in range(1, task.max_hops + 1)]
+        out = model.ponder_loss(
+            prompts.to(dev), targets.to(dev), max_thoughts=max_thoughts, beta=0.01
+        )
+        means = [
+            out.expected_thoughts[hops.to(dev) == k].mean().item()
+            for k in range(1, task.max_hops + 1)
+        ]
         return out.loss, "E[thoughts] by hops " + " / ".join(f"{m:.2f}" for m in means)
 
     train("ponder halting", ponder_steps, ponder_step)
 
-    print("\nevaluation (500 fresh problems per hop count, chance = "
-          f"{1 / task.n_symbols:.2f})")
+    print(
+        "\nevaluation (500 fresh problems per hop count, chance = "
+        f"{1 / task.n_symbols:.2f})"
+    )
     evals = {
         "learned halting": dict(max_thoughts=max_thoughts, halt_rule="learned"),
         "fixed max thoughts": dict(max_thoughts=max_thoughts, halt_rule="fixed"),
         "no thoughts": dict(max_thoughts=0, halt_rule="fixed"),
-        "ablated (zeros)": dict(max_thoughts=max_thoughts, halt_rule="learned", ablate="zeros"),
+        "ablated (zeros)": dict(
+            max_thoughts=max_thoughts, halt_rule="learned", ablate="zeros"
+        ),
     }
     header = "  ".join(f"{k}-hop acc / thoughts" for k in range(1, task.max_hops + 1))
     print(f"  {'mode':<20}{header}")
     for label, kwargs in evals.items():
         res = _accuracy_by_hops(model, task, 500, dev, **kwargs)
-        row = "  ".join(f"{res[k][0]:>8.2f} / {res[k][1]:<9.2f}" for k in range(1, task.max_hops + 1))
+        row = "  ".join(
+            f"{res[k][0]:>8.2f} / {res[k][1]:<9.2f}"
+            for k in range(1, task.max_hops + 1)
+        )
         print(f"  {label:<20}{row}")
     return model
 

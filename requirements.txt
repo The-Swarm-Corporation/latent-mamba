@@ -1,0 +1,4 @@
+# PyTorch comes from the base image (Dockerfile) or your environment: torch>=2.4
+transformers==5.16.1
+huggingface_hub==1.7.2
+wandb==0.19.5
