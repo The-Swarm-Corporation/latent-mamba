@@ -160,7 +160,7 @@ The demo is a smoke test of the pipeline, not a benchmark. Real benchmark result
 | Training & evaluation | [latent_mamba/train.py](latent_mamba/train.py) · [scripts/run_pipeline.sh](scripts/run_pipeline.sh) · [Dockerfile](Dockerfile) |
 | Chat | [latent_mamba/chat.py](latent_mamba/chat.py) |
 | Environment | [pyproject.toml](pyproject.toml) · [uv.lock](uv.lock) |
-| Guides | [docs/RUNPOD.md](docs/RUNPOD.md) (GPUs, RunPod) · [docs/architecture.md](docs/architecture.md) (design notes) |
+| Guides | [docs/RUNPOD.md](docs/RUNPOD.md) (GPUs, RunPod) · [docs/architecture.md](docs/architecture.md) (design notes) · [docs/TRAINING_7B.md](docs/TRAINING_7B.md) (scaling plan) |
 | Checkpoints | [huggingface.co/kye/latent-mamba](https://huggingface.co/kye/latent-mamba) |
 | Training logs | [wandb.ai/apacai/latent-mamba](https://wandb.ai/apacai/latent-mamba) |
 
@@ -188,11 +188,11 @@ $ uv run latent_mamba/train.py train \
 
 The baselines use the same command with `--method cot` (written chain of thought) or `--method nocot` (answer directly). `--model gpt2` trains the Coconut Transformer baseline.
 
-Quick smoke test on a laptop, a tiny randomly initialised model on a slice of the data (seconds)
+Quick smoke test on a laptop, a tiny randomly initialised model through every phase on a slice of the data (about a minute)
 
 ```bash
 $ uv run latent_mamba/train.py train --model tiny-mamba --dataset prosqa --method latent \
-    --max-train-examples 64 --max-val-examples 8 \
+    --max-train-examples 64 --max-val-examples 8 --max-latent-stage 1 \
     --cot-epochs 1 --epochs-per-stage 1 --final-epochs 1 --ponder-epochs 1 \
     --no-hf-upload
 ```
