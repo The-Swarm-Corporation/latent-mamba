@@ -85,6 +85,12 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
+# wandb 0.19 imports `distutils`, which Python 3.12 removed. setuptools ships a
+# replacement, but it is only registered once setuptools itself is imported, so
+# do that before any (lazy) `import wandb` below.
+with contextlib.suppress(ImportError):
+    __import__("setuptools")
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
