@@ -61,10 +61,12 @@ Notes
   names already match ``main.py``, so they load without renaming. The three
   special tokens use spare rows of the padded vocabulary and start from the
   embedding of "<<", as Coconut's do.
-* The selective scan runs in float32 even under bf16 autocast. ``--fused-scan``
-  swaps in the Triton kernel from ``mamba_ssm`` for prompts and answers. It is
-  checked against the reference scan (outputs and gradients) on startup and
-  refuses to run if they disagree.
+* The selective scan runs in float32 even under bf16 autocast. On CUDA, the
+  Triton kernel from ``mamba_ssm`` replaces it for prompts and answers by
+  default. It is checked against the reference scan (outputs and gradients) on
+  startup; if ``mamba_ssm`` is missing or disagrees, the reference scan is used
+  instead. ``--fused-scan`` makes the kernel mandatory, ``--no-fused-scan``
+  turns it off.
 * Multi-GPU runs use ``torchrun``. Gradients are all-reduced by hand rather
   than through DDP, because the losses are not ``forward`` calls and some
   parameters get no gradient in some stages.
@@ -85,9 +87,6 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
-# wandb 0.19 imports `distutils`, which Python 3.12 removed. setuptools ships a
-# replacement, but it is only registered once setuptools itself is imported, so
-# do that before any (lazy) `import wandb` below.
 with contextlib.suppress(ImportError):
     __import__("setuptools")
 
@@ -749,8 +748,8 @@ def _check_fused(device: torch.device) -> None:
             (got.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-12)
         ).item()
         if not err < 1e-2:
-            raise SystemExit(
-                f"--fused-scan: mamba_ssm kernel disagrees with the reference ({name} rel err {err:.2e})"
+            raise RuntimeError(
+                f"mamba_ssm kernel disagrees with the reference ({name} rel err {err:.2e})"
             )
     print("fused scan matches the reference (outputs and gradients)")
 
@@ -778,18 +777,38 @@ def enable_grad_checkpointing(bundle: Bundle) -> None:
         layer.forward = wrapped
 
 
-def install_scan(fused: bool, device: torch.device) -> None:
+def install_scan(fused: bool | None, device: torch.device) -> bool:
+    """Choose the selective scan. Returns True if the fused kernel is in use.
+
+    ``fused=None`` (the default) uses mamba_ssm's kernel on CUDA when it is
+    installed and passes the startup check, and the float32 reference scan
+    otherwise. ``True`` requires the kernel; ``False`` never uses it.
+    """
     lm.ssd_step = _step_fp32
     lm.ssd_chunked_scan = _scan_fp32
-    if fused:
-        if device.type != "cuda":
-            raise SystemExit("--fused-scan needs CUDA")
-        try:
-            import mamba_ssm  # noqa: F401
-        except ImportError as exc:
-            raise SystemExit("--fused-scan needs `pip install mamba-ssm`") from exc
+    if fused is False:
+        return False
+    if device.type != "cuda":
+        if fused:
+            raise SystemExit("--fused-scan needs a CUDA GPU")
+        return False
+    try:
+        __import__("mamba_ssm")
+    except ImportError as exc:
+        if fused:
+            raise SystemExit("--fused-scan needs `pip install mamba-ssm --no-build-isolation`") from exc
+        print("note: mamba_ssm is not installed, using the reference scan "
+              "(pip install mamba-ssm --no-build-isolation for the fused kernel)")
+        return False
+    try:
         _check_fused(device)
-        lm.ssd_chunked_scan = _scan_fused
+    except Exception as exc:  # a broken build or kernel must not change results
+        if fused:
+            raise SystemExit(f"--fused-scan: {exc}") from exc
+        print(f"warning: {exc}; using the reference scan")
+        return False
+    lm.ssd_chunked_scan = _scan_fused
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -1290,7 +1309,7 @@ def train_cmd(args: argparse.Namespace) -> None:
     d = setup_dist(args.device)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
-    install_scan(args.fused_scan, d.device)
+    fused = install_scan(args.fused_scan, d.device)
     preset = resolve_preset(args)
     out = Path(args.out or f"runs/{args.dataset}-{args.model}-{args.method}")
     if args.hf_upload and d.is_main:
@@ -1369,6 +1388,7 @@ def train_cmd(args: argparse.Namespace) -> None:
         "phases": [asdict(p) for p in phases],
         "params": count_params(model),
         "world_size": d.world,
+        "scan": "fused" if fused else "reference",
         "train_examples": len(train),
         "valid_examples": len(valid),
     }
@@ -1644,7 +1664,7 @@ def eval_modes(ckpt: dict, preset: Preset, kind: str) -> list[tuple[str, dict]]:
 def eval_cmd(args: argparse.Namespace) -> None:
     d = setup_dist(args.device)
     torch.manual_seed(args.seed)
-    install_scan(args.fused_scan, d.device)
+    fused = install_scan(args.fused_scan, d.device)
     bundle, ckpt = load_checkpoint(args.ckpt, args.chunk_size)
     bundle.model.to(d.device)
     preset = Preset(**ckpt["preset"])
@@ -1674,6 +1694,7 @@ def eval_cmd(args: argparse.Namespace) -> None:
     common = dict(max_new_tokens=max_new, batch_size=args.batch_size, dtype=args.dtype)
     result: dict[str, Any] = {
         "ckpt": str(args.ckpt),
+        "scan": "fused" if fused else "reference",
         "model": ckpt["model_name"],
         "method": ckpt["method"],
         "phase": ckpt["phase"],
@@ -1800,7 +1821,7 @@ def state_bytes(bundle: Bundle, prompt: Tensor, n: int) -> int:
 
 def bench_cmd(args: argparse.Namespace) -> None:
     device = pick_device(args.device)
-    install_scan(False, device)
+    fused = install_scan(args.fused_scan, device)
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[
         args.dtype
     ]
@@ -1823,6 +1844,7 @@ def bench_cmd(args: argparse.Namespace) -> None:
                 "batch_size": args.batch_size,
                 "dtype": args.dtype,
                 "device": str(device),
+                "scan": "fused" if fused and bundle.kind == "mamba" else "reference",
             }
             if bundle.kind == "gpt2" and args.prompt_len + n + 1 >= model.max_positions:
                 row["note"] = f"exceeds context ({model.max_positions})"
@@ -2102,8 +2124,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     g.add_argument(
         "--fused-scan",
-        action="store_true",
-        help="use mamba_ssm's Triton scan for prompts and answers",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="mamba_ssm's Triton scan for prompts and answers (default: on for CUDA if installed)",
     )
     g.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=True,
                    help="recompute Mamba layers in the backward pass to save memory")
@@ -2162,7 +2185,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--dtype", choices=("fp32", "bf16", "fp16"), default=None)
     p.add_argument("--chunk-size", type=int)
-    p.add_argument("--fused-scan", action="store_true")
+    p.add_argument("--fused-scan", action=argparse.BooleanOptionalAction, default=None,
+                   help="mamba_ssm's Triton scan for prompts and answers (default: on for CUDA if installed)")
     p.add_argument("--out")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device")
@@ -2186,6 +2210,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk-size", type=int, default=256)
     p.add_argument("--out", default="runs/bench.json")
     p.add_argument("--device")
+    p.add_argument("--fused-scan", action=argparse.BooleanOptionalAction, default=None,
+                   help="mamba_ssm's Triton scan for prompts and answers (default: on for CUDA if installed)")
     add_wandb_args(p)
     p.set_defaults(fn=bench_cmd)
 

@@ -48,6 +48,7 @@ Then open its web terminal or SSH in and run:
 cd /workspace
 git clone https://github.com/The-Swarm-Corporation/latent-mamba && cd latent-mamba
 pip install uv && uv pip install --system -r pyproject.toml --extra train   # reuses the pod's PyTorch
+pip install packaging ninja && pip install mamba-ssm --no-build-isolation   # optional: fused GPU scan kernels (can take ~20 min to compile)
 export HF_HOME=/workspace/hf-cache WANDB_DIR=/workspace
 
 # smoke test: about 20 minutes, small slices of ProsQA, everything end to end
@@ -99,7 +100,7 @@ The comparison needs each dataset run with these models:
 
 Useful `TRAIN_ARGS`:
 - `--batch-size 16 --grad-accum 2`: if a GPU runs out of memory (keeps the global batch at 128 on 4 GPUs)
-- `--fused-scan`: needs the image built with `--build-arg INSTALL_MAMBA_SSM=1`. It checks itself against the reference scan on startup
+- Fused scan: on by default when `mamba_ssm` is installed (the Docker image includes it). It checks itself against the reference scan on startup and falls back to it if they disagree. `--fused-scan` makes it mandatory, `--no-fused-scan` turns it off
 - `--wandb-checkpoints`: also stores checkpoints as W&B artifacts
 - `--max-tokens N`: drops overly long training examples
 

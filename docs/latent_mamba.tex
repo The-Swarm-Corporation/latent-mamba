@@ -1,5 +1,5 @@
 % Latent Mamba: Adaptive Continuous Reasoning in Constant Memory
-% Technical report, version 2. Single self-contained source: no external
+% Technical report. Single self-contained source: no external
 % figures or .bib file. Compile with:  tectonic latent_mamba.tex
 %                                  or:  pdflatex latent_mamba.tex (twice)
 \documentclass[10pt]{article}
@@ -50,7 +50,6 @@
 \definecolor{softgray}{RGB}{120,120,120}
 
 \newtheorem{proposition}{Proposition}
-\newcommand{\pending}{\textcolor{softgray}{pending}}
 \newcommand{\eot}{\texttt{<eot>}}
 \renewcommand{\bot}{\texttt{<bot>}}
 
@@ -62,7 +61,7 @@
 \maketitle
 
 \begin{abstract}
-Chain-of-thought reasoning spends extra compute by writing tokens, and in a Transformer every token also grows the key--value cache. We describe \emph{Latent Mamba}, an architecture that lets a Mamba-2 language model reason in continuous latent space for an input-dependent number of steps while its memory stays constant. The model feeds its normalised final hidden state back as its next input through a learned \emph{thought projector} that adds a thinking-mode embedding, and a \emph{halting head} decides when to stop. We observe that in a selective state-space model, depth recurrence with a shared state is the same computation as interleaving self-generated latent inputs along the sequence, which motivates placing thoughts in time rather than in depth. Training follows a Coconut-style curriculum and then a PonderNet objective; because the recurrent state has a fixed size, the answer can be scored after every thought step in a single batched pass. This second version adds exact left-padded batching, a memory-efficient training path, a port of pretrained Mamba-2 weights, and the first experiments. Fine-tuning a pretrained 130M-parameter Mamba-2 on ProsQA with this recipe, the model answers \textbf{98.7\%} of validation questions while reasoning entirely in latent space with six thoughts, against 74.3\% for the same model trained to write its chain of thought and 80.0\% for the same model trained to answer directly. These are validation results from a single run; test-set accuracy, thought ablations, learned halting, the Transformer baseline and measured memory are being collected and are marked as pending.
+Chain-of-thought reasoning spends extra compute by writing tokens, and in a Transformer every token also grows the key--value cache. We describe \emph{Latent Mamba}, an architecture that lets a Mamba-2 language model reason in continuous latent space for an input-dependent number of steps while its memory stays constant. The model feeds its normalised final hidden state back as its next input through a learned \emph{thought projector} that adds a thinking-mode embedding, and a \emph{halting head} decides when to stop. We observe that in a selective state-space model, depth recurrence with a shared state is the same computation as interleaving self-generated latent inputs along the sequence, which motivates placing thoughts in time rather than in depth. Training follows a Coconut-style curriculum and then a PonderNet objective; because the recurrent state has a fixed size, the answer can be scored after every thought step in a single batched pass. Fine-tuning a pretrained 130M-parameter Mamba-2 on ProsQA with this recipe, the model answers \textbf{99.0\%} of held-out test questions while reasoning entirely in latent space with six thoughts, against 70.8\% for the same model trained to write its chain of thought and 74.6\% for the same model trained to answer directly. Replacing the thoughts with zeros or noise at test time drops accuracy to 77\% or below, so the gain comes from what the thoughts contain. The learned halting head stops after 3.1 thoughts on average at 98.6\% accuracy, matching a fixed budget of three, but adapts only weakly to problem difficulty. Measured on GPU, the recurrent state stays at 18.2\,MiB for budgets up to 4{,}096 thoughts, while our reference implementation is 3--5$\times$ slower per thought than GPT-2. All results come from one seed on one synthetic task.
 \end{abstract}
 
 % =========================================================================
@@ -81,7 +80,7 @@ Selective state-space models (SSMs)~\cite{gu2022s4} such as Mamba and Mamba-2~\c
 \item \textbf{Latent Mamba} (Figure~\ref{fig:arch}): a thought projector with a thinking-mode embedding, a halting head, and functional fixed-size state handling. The added parameters are about 0.3\% of a 2.7B model and 0.6\% of a 130M model.
 \item A training recipe (Algorithms~\ref{alg:curriculum} and~\ref{alg:ponder}) and an adaptive inference procedure (Algorithm~\ref{alg:generate}). PonderNet scoring is batched across thought steps, which is cheap only because SSM state is fixed-size.
 \item Exact batching of prompts of different lengths (Proposition~\ref{prop:padding}) and a training path that cuts saved activations at batch 32 from 75\,GiB to 4.2\,GiB with identical gradients (Section~\ref{sec:scale}).
-\item A reference implementation that loads pretrained Mamba-2 checkpoints without renaming, numerical verification of its kernels (Table~\ref{tab:verify}), and an experiment on ProsQA (Section~\ref{sec:experiments}) where the fully latent model reaches 98.7\% validation accuracy against 74.3\% (written CoT) and 80.0\% (no CoT).
+\item A reference implementation that loads pretrained Mamba-2 checkpoints without renaming, numerical verification of its kernels (Table~\ref{tab:verify}), and an experiment on ProsQA (Section~\ref{sec:experiments}) where the fully latent model reaches 99.0\% test accuracy against 70.8\% (written CoT) and 74.6\% (no CoT), with thought ablations, a thinking-budget sweep, learned halting, and measured memory and latency.
 \end{itemize}
 
 % =========================================================================
@@ -245,7 +244,7 @@ L\,\big[(K-1)(d_{\text{inner}} + 2N) + HPN\big]
 \end{equation}
 values, independent of both prompt length and thought count. For the Mamba-2 2.7B configuration ($L{=}64$, $d{=}2560$, $N{=}128$, $P{=}64$, $K{=}4$) this is 671{,}488 values per layer, or 82.0\,MiB in fp16. A 32-layer Transformer of the same width with multi-head attention stores 0.3125\,MiB of KV cache per token; with $4\times$ grouped-query attention~\cite{ainslie2023gqa}, 0.078\,MiB. Multi-query attention~\cite{shazeer2019mqa} shrinks the per-token cost further, but the cache still grows with every token.
 
-Figure~\ref{fig:memory} compares the three after a 512-token prompt. The grouped-query Transformer is smaller until about 1{,}050 cached tokens, so the advantage is not universal. Beyond that point every Transformer thought costs memory, while Latent Mamba's footprint stays flat at any thinking budget. At the scale used in our experiments the comparison is starker: Mamba-2 130M ($L{=}24$, $d_{\text{inner}}{=}1536$, $H{=}24$) holds 9.25\,MiB of state in bf16, while GPT-2 124M~\cite{radford2019gpt2} stores 36\,KiB of KV cache per token, so its cache already exceeds Latent Mamba's whole state after 263 tokens.
+Figure~\ref{fig:memory} compares the three after a 512-token prompt. The grouped-query Transformer is smaller until about 1{,}050 cached tokens, so the advantage is not universal. Beyond that point every Transformer thought costs memory, while Latent Mamba's footprint stays flat at any thinking budget. At the scale used in our experiments the comparison is starker: Mamba-2 130M ($L{=}24$, $d_{\text{inner}}{=}1536$, $H{=}24$) holds 9.25\,MiB of state in bf16, while GPT-2 124M~\cite{radford2019gpt2} stores 36\,KiB of KV cache per token, so its cache already exceeds Latent Mamba's whole state after 263 tokens. Section~\ref{sec:bench} measures both on GPU.
 
 \begin{figure}[t]
 \centering
@@ -405,7 +404,7 @@ Activation checkpointing vs.\ none, gradients (float32, relative) & $0$ \\
 
 \subsection{Setup}
 
-\paragraph{Task.} ProsQA~\cite{hao2024coconut} asks whether an entity belongs to one of two fictional concepts, given a randomly generated graph of ``every A is a B'' facts. Answering requires finding a path through the graph, with distracting branches, so it rewards planning and search. Each question has two candidate answers, so chance is 50\%. We use Coconut's splits (17{,}886 / 300 / 500 examples). With the GPT-NeoX tokenizer~\cite{black2022neox}, questions are long (median 357 tokens, 99th percentile 502, maximum 591); the written reasoning plus answer is short (median 50 tokens). Validation questions need 3 to 6 gold reasoning steps (124, 133, 36 and 7 questions respectively).
+\paragraph{Task.} ProsQA~\cite{hao2024coconut} asks whether an entity belongs to one of two fictional concepts, given a randomly generated graph of ``every A is a B'' facts. Answering requires finding a path through the graph, with distracting branches, so it rewards planning and search. Each question has two candidate answers, so chance is 50\%. We use Coconut's splits (17{,}886 / 300 / 500 examples). With the GPT-NeoX tokenizer~\cite{black2022neox}, questions are long (median 357 tokens, 99th percentile 502, maximum 591); the written reasoning plus answer is short (median 50 tokens). Questions need 3 to 6 gold reasoning steps (124, 133, 36 and 7 validation questions and 202, 217, 69 and 12 test questions respectively).
 
 \paragraph{Models.} All three models start from the same pretrained Mamba-2 130M checkpoint and differ only in what they are trained to output:
 \begin{itemize}
@@ -414,7 +413,9 @@ Activation checkpointing vs.\ none, gradients (float32, relative) & $0$ \\
 \item \textbf{Latent Mamba:} the full curriculum (stage 0 = written CoT, stages 1--6, final stage with all steps replaced by thoughts), then the halting stage.
 \end{itemize}
 
-\paragraph{Training.} We follow Coconut's published ProsQA configuration: $c = 1$ thought per step, $K = 6$ latent stages, 5 epochs per stage including stage 0, and 15 epochs in the final stage, for 50 epochs in total; the halting stage adds 5 epochs. The baselines train for 5 epochs, matching stage 0. Table~\ref{tab:hparams} lists the remaining settings. One difference from Coconut is the batch: we train on one GPU with batch 32, where Coconut used four GPUs with 32 each. Answers are decoded greedily (up to 128 tokens) and scored by exact match of the text after the last ``\texttt{\#}'', Coconut's rule.
+\paragraph{Training.} We follow Coconut's published ProsQA configuration: $c = 1$ thought per step, $K = 6$ latent stages, 5 epochs per stage including stage 0, and 15 epochs in the final stage, for 50 epochs in total; the halting stage adds 5 epochs. The baselines train for 5 epochs, matching stage 0. Table~\ref{tab:hparams} lists the remaining settings. One difference from Coconut is the batch: we train on one GPU with batch 32, where Coconut used four GPUs with 32 each. Each phase continues from the weights at the end of the previous one, and the checkpoint kept for a phase is its best validation epoch, as in Coconut. Answers are decoded greedily (up to 128 tokens) and scored by exact match of the text after the last ``\texttt{\#}'', Coconut's rule.
+
+\paragraph{Evaluation.} We report test accuracy on the 500 held-out questions for the kept checkpoint of each model; for Latent Mamba this is the halting-stage checkpoint (epoch 51). We run it in six modes: \emph{learned} halting ($\tau = 0.5$, at most $N = 6$ thoughts); \emph{fixed}, exactly 6 thoughts; \emph{convergence} halting (relative change below $10^{-2}$, at most 6); \emph{no thoughts}, decoding directly after \bot\eot; and two ablations that run 6 thoughts but replace the content of every thought with zeros or with noise of matching RMS. A sweep fixes the budget at every value from 0 to 12 thoughts.
 
 \begin{table}[t]
 \centering
@@ -440,39 +441,42 @@ Latent stages $K$ & 6 & Seed & 0 (one run per model) \\
 \begin{tikzpicture}
 \begin{axis}[
   width=0.95\linewidth, height=6.2cm,
-  xmin=0.5, xmax=50.5, ymin=65, ymax=101,
+  xmin=0.5, xmax=55.5, ymin=65, ymax=103.5,
   xlabel={training epoch}, ylabel={validation accuracy (\%)},
-  xtick={1,5,10,15,20,25,30,35,40,45,50},
+  xtick={1,5,10,15,20,25,30,35,40,45,50,55},
   legend style={font=\scriptsize,at={(0.985,0.04)},anchor=south east,draw=black!15,fill=white,cells={anchor=west}},
   tick label style={font=\scriptsize}, label style={font=\small},
   grid=major, grid style={black!8}, clip=false]
   % stage shading and labels
-  \fill[black!4] (axis cs:5.5,65) rectangle (axis cs:10.5,101);
-  \fill[black!4] (axis cs:15.5,65) rectangle (axis cs:20.5,101);
-  \fill[black!4] (axis cs:25.5,65) rectangle (axis cs:30.5,101);
-  \fill[addteal!6] (axis cs:35.5,65) rectangle (axis cs:50.5,101);
-  \node[font=\scriptsize,text=softgray] at (axis cs:3,99.6) {stage 0};
-  \node[font=\scriptsize,text=softgray] at (axis cs:8,99.6) {1};
-  \node[font=\scriptsize,text=softgray] at (axis cs:13,99.6) {2};
-  \node[font=\scriptsize,text=softgray] at (axis cs:18,99.6) {3};
-  \node[font=\scriptsize,text=softgray] at (axis cs:23,99.6) {4};
-  \node[font=\scriptsize,text=softgray] at (axis cs:28,99.6) {5};
-  \node[font=\scriptsize,text=softgray] at (axis cs:33,99.6) {6};
-  \node[font=\scriptsize,text=softgray] at (axis cs:43,99.6) {final};
+  \fill[black!4] (axis cs:5.5,65.2) rectangle (axis cs:10.5,103.3);
+  \fill[black!4] (axis cs:15.5,65.2) rectangle (axis cs:20.5,103.3);
+  \fill[black!4] (axis cs:25.5,65.2) rectangle (axis cs:30.5,103.3);
+  \fill[addteal!6] (axis cs:35.5,65.2) rectangle (axis cs:50.5,103.3);
+  \fill[mambapurple!8] (axis cs:50.5,65.2) rectangle (axis cs:55.45,103.3);
+  \node[font=\scriptsize,text=softgray] at (axis cs:3,102.2) {stage 0};
+  \node[font=\scriptsize,text=softgray] at (axis cs:8,102.2) {1};
+  \node[font=\scriptsize,text=softgray] at (axis cs:13,102.2) {2};
+  \node[font=\scriptsize,text=softgray] at (axis cs:18,102.2) {3};
+  \node[font=\scriptsize,text=softgray] at (axis cs:23,102.2) {4};
+  \node[font=\scriptsize,text=softgray] at (axis cs:28,102.2) {5};
+  \node[font=\scriptsize,text=softgray] at (axis cs:33,102.2) {6};
+  \node[font=\scriptsize,text=softgray] at (axis cs:43,102.2) {final};
+  \node[font=\scriptsize,text=softgray] at (axis cs:53,102.2) {halt};
   \addplot[addteal!90!black,very thick,mark=*,mark size=1.1pt] coordinates {
     (1,73.33) (2,71.67) (3,73.00) (4,72.00) (5,74.33) (6,71.00) (7,72.00) (8,73.67) (9,74.00) (10,74.00)
     (11,73.67) (12,75.00) (13,76.00) (14,72.67) (15,73.67) (16,78.33) (17,84.67) (18,83.00) (19,84.00) (20,86.33)
     (21,88.33) (22,92.00) (23,92.00) (24,93.00) (25,93.33) (26,96.67) (27,95.33) (28,95.33) (29,97.33) (30,97.00)
     (31,97.67) (32,98.00) (33,98.33) (34,99.00) (35,98.67) (36,98.67) (37,98.00) (38,98.33) (39,98.33) (40,97.67)
-    (41,98.33) (42,98.00)};
+    (41,98.33) (42,98.00) (43,98.67) (44,98.67) (45,97.67) (46,98.33) (47,97.67) (48,97.67) (49,96.33) (50,97.00)
+    (51,99.33) (52,99.00) (53,99.33) (54,97.67) (55,98.67)};
   \addplot[lossred,thick,mark=square*,mark size=1.2pt] coordinates {(1,73.33) (2,71.67) (3,73.00) (4,72.00) (5,74.33)};
   \addplot[mambapurple,thick,mark=triangle*,mark size=1.6pt] coordinates {(1,80.00) (2,79.00) (3,79.33) (4,77.67) (5,78.00)};
-  \addplot[mambapurple,dashed,domain=0.5:50.5,samples=2] {80};
-  \addplot[lossred,dashed,domain=0.5:50.5,samples=2] {74.33};
+  \addplot[mambapurple,thick,dashed,domain=0.5:55.5,samples=2] {80};
+  \addplot[lossred,thick,dashed,domain=0.5:55.5,samples=2] {74.33};
   \legend{Latent Mamba (thoughts $=$ stage), Written CoT, No CoT, best no CoT, best written CoT}
 \end{axis}
 \end{tikzpicture}
-\caption{Validation accuracy on ProsQA (300 questions) after every epoch. Shaded bands mark curriculum stages; at stage $k$ the model uses $k$ thoughts in place of the first $k$ reasoning steps, and the final stage replaces all steps with 6 thoughts. Stage 0 of the latent run is identical to the written-CoT run (same seed and data order). The final stage is still running; epochs 43--50 and the halting stage are pending.}
+\caption{Validation accuracy on ProsQA (300 questions) after every epoch. Shaded bands mark curriculum stages; at stage $k$ the model uses $k$ thoughts in place of the first $k$ reasoning steps, and the final stage replaces all steps with 6 thoughts. In the halting stage (``halt'') the model chooses its own budget and uses about 3 thoughts. Stage 0 of the latent run is identical to the written-CoT run (same seed and data order).}
 \label{fig:curve}
 \end{figure}
 
@@ -495,20 +499,46 @@ Latent Mamba, stage 1 & 1 & all but the first & 74.0 \\
 \quad stage 5 & 5 & \dots & 97.3 \\
 \quad stage 6 & 6 & none for $s \le 6$ & 99.0 \\
 \quad \textbf{final (fully latent)} & \textbf{6} & \textbf{none} & \textbf{98.7} \\
-\quad halting stage & adaptive, $\le 6$ & none & \pending \\
+\quad halting stage & learned, mean 3.1 & none & \textbf{99.3} \\
 \bottomrule
 \end{tabular}
 \caption{Best validation accuracy (\%) per model and curriculum stage on ProsQA. One standard error at these sample sizes is about 2.5 points near 75\% and under 1 point near 98\%.}
 \label{tab:stages}
 \end{table}
 
-\paragraph{Latent reasoning beats both baselines by a wide margin.} With all language reasoning replaced by six thoughts, the model reaches 98.7\% validation accuracy, 24.3 points above written CoT and 18.7 points above answering directly. Coconut reports 97.0\% on the ProsQA test set with GPT-2~\cite{hao2024coconut}, so a 130M Mamba-2 with a constant-size state reaches the same range. That is a comparison across papers and splits; our own Coconut GPT-2 run, in the same pipeline, is pending.
+\paragraph{Latent reasoning beats both baselines by a wide margin on held-out data.} On the test set the latent model answers 99.0\% of questions with six thoughts, 28.2 points above written CoT and 24.4 points above answering directly (Table~\ref{tab:test}). For Latent Mamba, validation and test agree to within a point. The baselines lose 3.5 (written CoT) and 5.4 (no CoT) points from validation to test, as expected when the best of five noisy validation epochs is selected, so the gap widens on held-out data. Coconut reports 97.0\% on the ProsQA test set with GPT-2~\cite{hao2024coconut}, so a 130M Mamba-2 with a constant-size state reaches the same range. That comparison crosses papers; our own Coconut GPT-2 run in the same pipeline remains to be done.
 
-\paragraph{Writing the chain of thought hurts.} Written CoT scores below no CoT (74.3\% vs.\ 80.0\%), about 1.7 standard errors apart, so the gap is suggestive rather than conclusive. Coconut found the two close on ProsQA (77.5\% vs.\ 76.7\% for GPT-2). Both observations fit the view that ProsQA's written reasoning forces the model to commit to one branch per sentence, so an early wrong step propagates.
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}lcc@{}}
+\toprule
+Model and inference mode & Thoughts (mean) & Test accuracy \\
+\midrule
+No CoT & 0 & 74.6 \\
+Written CoT & 0 & 70.8 \\
+\midrule
+Latent Mamba, learned halting & 3.11 & 98.6 \\
+\quad fixed budget & 6 & \textbf{99.0} \\
+\quad convergence halting & 6.00 & \textbf{99.0} \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Ablations, same checkpoint}} \\
+\quad no thoughts & 0 & 73.6 \\
+\quad 6 thoughts, content set to zero & 6 & 76.8 \\
+\quad 6 thoughts, content replaced by noise & 6 & 75.8 \\
+\bottomrule
+\end{tabular}
+\caption{Test accuracy (\%) on ProsQA (500 questions). All Latent Mamba rows use the same halting-stage checkpoint. One standard error is about 2 points near 74\% and 0.5 points near 99\%.}
+\label{tab:test}
+\end{table}
+
+\paragraph{The thoughts carry the information.} With the thoughts removed, the same checkpoint scores 73.6\%, about the level of the no-CoT baseline. Running six thoughts whose content is set to zero, which turns them into pause tokens~\cite{goyal2024pause}, or replaced by noise gives 76.8\% and 75.8\%: the extra passes alone recover at most about 3 of the 25 points. What the thoughts contain, not the extra computation, carries the reasoning. The model was never trained with empty thoughts, so this test-time ablation cannot rule out that a model \emph{trained} with pause tokens would learn to use the extra passes; that control remains open.
+
+\paragraph{Writing the chain of thought hurts.} Written CoT scores below no CoT on both splits (70.8\% vs.\ 74.6\% on test, 74.3\% vs.\ 80.0\% on validation). On test the two are about 1.4 standard errors apart, so the gap is suggestive rather than conclusive. Coconut found the two close on ProsQA (77.5\% vs.\ 76.7\% for GPT-2). Both observations fit the view that ProsQA's written reasoning forces the model to commit to one branch per sentence, so an early wrong step propagates. The logged test samples show one such failure: after following a wrong branch, the model repeats ``Every zhorpus is a.'' until the length limit.
 
 \paragraph{The gain appears once several steps are latent.} Accuracy is flat while one or two steps are latent (74--76\%) and then rises sharply: 86.3\% at three thoughts, 93.3\% at four, 97.3\% at five. Section~\ref{sec:discussion} discusses why.
 
-\paragraph{The gain holds on longer problems.} Table~\ref{tab:bysteps} splits validation accuracy by the number of gold reasoning steps. Written CoT is weakest on four- and five-step questions; the latent model stays above 94\% on every group.
+\paragraph{The gain holds on longer problems.} Table~\ref{tab:bysteps} splits test accuracy by the number of gold reasoning steps. Written CoT is weakest on four- and five-step questions (68--69\%); the latent model stays above 97\% on every group.
 
 \begin{table}[t]
 \centering
@@ -516,67 +546,106 @@ Latent Mamba, stage 1 & 1 & all but the first & 74.0 \\
 \begin{tabular}{@{}lcccc@{}}
 \toprule
 Gold reasoning steps & 3 & 4 & 5 & 6 \\
-Questions & 124 & 133 & 36 & 7 \\
+Test questions & 202 & 217 & 69 & 12 \\
 \midrule
-No CoT (epoch 5) & 75.0 & 81.2 & 77.8 & 71.4 \\
-Written CoT (epoch 5) & 79.0 & 69.9 & 72.2 & 85.7 \\
-Latent Mamba, final stage (epoch 42) & \textbf{99.2} & \textbf{97.7} & \textbf{94.4} & \textbf{100} \\
+No CoT & 74.3 & 74.7 & 75.4 & 75.0 \\
+Written CoT & 73.8 & 68.7 & 68.1 & 75.0 \\
+Latent Mamba, fixed 6 thoughts & \textbf{99.0} & \textbf{99.1} & \textbf{98.6} & \textbf{100} \\
+Latent Mamba, learned halting & 98.5 & \textbf{99.1} & 97.1 & \textbf{100} \\
+\quad thoughts used (mean) & 2.99 & 3.13 & 3.35 & 3.42 \\
 \bottomrule
 \end{tabular}
-\caption{Validation accuracy (\%) by number of gold reasoning steps. The six-step group is small.}
+\caption{Test accuracy (\%) by number of gold reasoning steps, and the number of thoughts learned halting uses for each group. The six-step group is small.}
 \label{tab:bysteps}
 \end{table}
 
-\paragraph{Cost.} The two baselines took about 44 and 41 minutes on one H100 NVL, including validation. Each thought is one more sequential pass through all 24 layers, so throughput falls as the curriculum adds thoughts (Table~\ref{tab:speed}): from 1.06 batches per second at stage 0 to 0.50 at six thoughts, roughly 0.18 seconds per thought per batch of 32. The thought steps process one token per example and are cheap in arithmetic; we attribute most of their cost to per-layer kernel launches, which a fused single-step kernel or CUDA graphs would reduce.
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.62\linewidth, height=4.8cm,
+  xmin=-0.5, xmax=12.5, ymin=70, ymax=101,
+  xlabel={fixed thinking budget at test time (thoughts)},
+  ylabel={test accuracy (\%)},
+  xtick={0,1,2,3,4,5,6,7,8,9,10,11,12},
+  legend style={font=\scriptsize,at={(0.985,0.04)},anchor=south east,draw=black!15,fill=white,cells={anchor=west}},
+  tick label style={font=\scriptsize}, label style={font=\small},
+  grid=major, grid style={black!8}, clip=false]
+  \fill[black!4] (axis cs:6.5,70.15) rectangle (axis cs:12.45,100.85);
+  \node[font=\scriptsize,text=softgray] at (axis cs:9.5,90) {beyond training budget};
+  \addplot[addteal!90!black,very thick,mark=*,mark size=1.3pt] coordinates {
+    (0,73.6) (1,94.2) (2,97.4) (3,98.6) (4,98.8) (5,99.0) (6,99.0) (7,99.0) (8,99.0) (9,98.4) (10,98.4) (11,98.4) (12,98.4)};
+  \addplot[only marks,mark=diamond*,mark size=2.6pt,lossred] coordinates {(3.11,98.6)};
+  \addplot[mambapurple,thick,dashed,domain=-0.5:12.5,samples=2] {74.6};
+  \legend{fixed budget, learned halting (mean 3.11), No CoT baseline}
+\end{axis}
+\end{tikzpicture}
+\caption{Test accuracy of the halting-stage checkpoint when the number of thoughts is fixed at test time. Training used at most 6 thoughts.}
+\label{fig:sweep}
+\end{figure}
+
+\paragraph{One thought does most of the work, and the budget extrapolates.} Figure~\ref{fig:sweep} fixes the number of thoughts at test time. A single thought lifts accuracy from 73.6\% to 94.2\%, two reach 97.4\%, and accuracy saturates at 99.0\% from five thoughts on. Budgets above the six used in training lose at most 0.6 points up to twelve thoughts. During the curriculum, accuracy rose only once three or more steps were latent, yet at test time one thought already recovers most of the gain. The halting stage trains the answer after every number of thoughts from 1 to 6 at once, and it lifted validation accuracy from 97.0\% to 99.3\% within one epoch, so it may also teach the model to compress its search into fewer steps. We did not evaluate the pre-halting checkpoint at small budgets, so we cannot yet separate the two effects.
+
+\paragraph{Learned halting finds the knee of the curve but adapts only weakly.} The halting head stops after 3.11 thoughts on average and scores 98.6\%, half the thoughts of the fixed mode for 0.4 points (two questions). A fixed budget of three scores the same 98.6\%, so on this task the learned rule matches, but does not beat, a well-chosen fixed budget; its value is that it finds this budget without a sweep. Its thought count rises only slightly with difficulty, from 2.99 on three-step questions to 3.42 on six-step ones (Table~\ref{tab:bysteps}). The convergence rule never fired at tolerance $10^{-2}$ and always used all six thoughts: consecutive thoughts keep changing by more than 1\%, so the trajectory does not settle to a fixed point within the training budget.
+
+\paragraph{Cost.} The two baselines took about 44 and 41 minutes on one H100 NVL, including validation, and the full 55-epoch latent run took 14.0 hours. Each thought is one more sequential pass through all 24 layers, so throughput falls as the curriculum adds thoughts (Table~\ref{tab:speed}): from 1.06 batches per second at stage 0 to 0.50 at six thoughts, roughly 0.18 seconds per thought per batch of 32. The thought steps process one token per example and are cheap in arithmetic; we attribute most of their cost to per-layer kernel launches, which a fused single-step kernel or CUDA graphs would reduce.
 
 \begin{table}[t]
 \centering
 \small
-\begin{tabular}{@{}lcccccccc@{}}
+\begin{tabular}{@{}lccccccccc@{}}
 \toprule
-Stage & 0 & 1 & 2 & 3 & 4 & 5 & 6 & final \\
-Thoughts & 0 & 1 & 2 & 3 & 4 & 5 & 6 & 6 \\
+Stage & 0 & 1 & 2 & 3 & 4 & 5 & 6 & final & halting \\
+Thoughts & 0 & 1 & 2 & 3 & 4 & 5 & 6 & 6 & 6 (scored 1--6) \\
 \midrule
-Batches / s (batch 32) & 1.06 & 0.92 & 0.82 & 0.71 & 0.59 & 0.57 & 0.50 & 0.53 \\
+Batches / s (batch 32) & 1.06 & 0.92 & 0.82 & 0.71 & 0.59 & 0.57 & 0.50 & 0.53 & 0.55 \\
 \bottomrule
 \end{tabular}
 \caption{Training throughput by stage for Mamba-2 130M on one H100 NVL, with activation checkpointing.}
 \label{tab:speed}
 \end{table}
 
-\subsection{Pending measurements}
+\subsection{Inference memory and latency}
+\label{sec:bench}
 
-The run is in progress. Table~\ref{tab:pending} lists the measurements that complete the evaluation; all are produced by the released pipeline when training ends, except the last three rows, which need additional runs.
+We measure both architectures at equal size on the same H100 NVL: Mamba-2 130M and GPT-2 124M, batch 1, a 512-token prompt, bf16 weights, and $n$ thoughts followed by one answer token (Table~\ref{tab:bench}). Weights are random, which does not affect memory or time. State size is read from the cache objects, peak memory is the maximum allocated above the weights during generation, and latency is the median of repeated runs.
 
 \begin{table}[t]
 \centering
 \small
-\begin{tabular}{@{}p{0.47\linewidth}p{0.33\linewidth}c@{}}
+\begin{tabular}{@{}llrrrrrrr@{}}
 \toprule
-Measurement & Question it answers & Status \\
+& Thoughts $n$ & 0 & 16 & 64 & 256 & 480 & 1{,}024 & 4{,}096 \\
 \midrule
-Test accuracy (500 questions) of all three models & Does the gap hold on held-out data? & \pending \\
-Zero and noise thought ablations; no thoughts & Do the thoughts carry information? & \pending \\
-Accuracy vs.\ fixed budget, 0--12 thoughts & Does more thinking help, and where does it saturate? & \pending \\
-Learned and convergence halting; thoughts by gold steps & Does halting adapt to difficulty? & \pending \\
-State size, peak memory and latency vs.\ budget & Constant memory measured on GPU & \pending \\
-Coconut GPT-2 124M, same pipeline & Mamba vs.\ Transformer at equal size & \pending \\
+\multirow{2}{*}{State / KV cache (MiB)} & Latent Mamba & 18.2 & 18.2 & 18.2 & 18.2 & 18.2 & 18.2 & 18.2 \\
+& GPT-2 & 18.0 & 18.6 & 20.3 & 27.0 & 34.9 & -- & -- \\
 \midrule
-Pause-token control (curriculum with empty thoughts) & Is it thought content or extra compute? & not started \\
-No CoT trained for 55 epochs & Is it the longer training? & not started \\
-Additional seeds; ProntoQA; GSM8k & Robustness and generality & not started \\
+\multirow{2}{*}{Peak extra memory (MiB)} & Latent Mamba & 154 & 154 & 154 & 154 & 154 & 154 & 154 \\
+& GPT-2 & 34.6 & 34.6 & 34.6 & 38.7 & 38.7 & -- & -- \\
+\midrule
+\multirow{2}{*}{Latency (s)} & Latent Mamba & 0.07 & 0.41 & 1.40 & 5.89 & 10.20 & 20.19 & 55.91 \\
+& GPT-2 & 0.01 & 0.11 & 0.44 & 1.64 & 1.85 & -- & -- \\
 \bottomrule
 \end{tabular}
-\caption{Measurements that remain. ``Pending'' items run automatically at the end of the current run.}
-\label{tab:pending}
+\caption{Inference after a 512-token prompt on one H100 NVL (batch 1, bf16), using the reference PyTorch implementation for Mamba. ``--'': beyond GPT-2's 1{,}024-position context.}
+\label{tab:bench}
 \end{table}
+
+\paragraph{The state is constant.} Latent Mamba's state stays at 18.2\,MiB from zero to 4{,}096 thoughts. This is twice the 9.25\,MiB computed from Equation~\eqref{eq:mem} because the implementation keeps the SSM state in float32 (Section~\ref{sec:scale}); only the convolution window is bf16. GPT-2's cache grows by 36\,KiB per token and passes the Mamba state after about seven thoughts. At 480 thoughts it is $1.9\times$ larger, and GPT-2 cannot think beyond its 1{,}024-position context at all.
+
+\paragraph{Peak memory and speed favour GPT-2 at this scale.} Peak memory above the weights is 154\,MiB for Latent Mamba at every budget, against 35--39\,MiB for GPT-2. The peak is set by the 512-token prefill, where the reference chunked scan materialises float32 intermediates, not by thinking. Latent Mamba is also 3--5$\times$ slower, about 14--21\,ms per thought against 4--6\,ms for GPT-2. Three factors contribute: Mamba-2 130M has 24 layers to GPT-2's 12; each thought runs our unfused single-step recurrence as several small PyTorch kernels per layer; and the benchmark did not use the fused \texttt{mamba\_ssm} kernels. Constant memory is therefore established, but a wall-clock advantage would need a fused single-step kernel or CUDA graphs, and reasoning much longer than ProsQA's: at six thoughts, the KV cache a Transformer adds is negligible.
+
+\subsection{What remains}
+\label{sec:remaining}
+
+Four comparisons are still missing: Coconut with GPT-2 124M trained in the same pipeline, which isolates the backbone; a pause-token model trained through the same curriculum with empty thoughts, which separates thought content from extra computation as a trained rather than test-time control; a no-CoT model trained for 55 epochs, which matches training length; and more seeds and model sizes, together with ProntoQA and GSM8k. The released pipeline already trains the GPT-2 baseline and runs GSM8k.
 
 % =========================================================================
 \section{Discussion: why does latent reasoning help here?}
 \label{sec:discussion}
 % =========================================================================
 
-The following explanations are hypotheses. The pending ablations and controls are designed to test them.
+The thought ablations of Table~\ref{tab:test} show that the content of the thoughts matters. Why it helps on this task is less certain; the following explanations are hypotheses.
 
 \paragraph{Search without committing.} A written chain must choose one node of the graph per sentence. A continuous thought is a vector and can represent several candidate nodes at once, narrowing them over successive thoughts, which resembles breadth-first search. Coconut observed exactly this in GPT-2 on ProsQA by decoding thoughts through the language-model head~\cite{hao2024coconut}. The shape of our curve supports the same reading: little changes while only one or two steps are latent, and accuracy rises once three or more consecutive steps can stay in latent space, where keeping alternatives alive pays off.
 
@@ -584,7 +653,7 @@ The following explanations are hypotheses. The pending ablations and controls ar
 
 \paragraph{A large fixed-size workspace.} The 130M model carries a $24 \times 64 \times 128$ state in each of 24 layers. Thoughts read the graph facts held in this state and refine them in place, and nothing accumulates, which suits a task whose input is large (hundreds of tokens of facts) and whose reasoning is short.
 
-\paragraph{Alternative explanations.} Three confounds remain. (i) The latent model trained for 50 epochs and the baselines for 5. No CoT peaked at its first epoch and declined slightly afterwards, which makes ``more training'' a weak explanation, but only the 55-epoch control settles it. (ii) Extra computation alone might help even without informative thoughts; the zero- and noise-thought ablations at test time and a trained pause-token control~\cite{goyal2024pause} separate the two. (iii) Validation accuracy also selects checkpoints and is therefore slightly optimistic; the test set does not.
+\paragraph{Alternative explanations.} Three confounds were open; the test results settle one and narrow another. (i) Training length: the latent model trained for 55 epochs and the baselines for 5. No CoT peaked at its first epoch and declined afterwards, which makes ``more training'' a weak explanation, but only the 55-epoch control settles it. (ii) Extra computation: zero and noise thoughts at test time recover at most 3 of the 25 points (Table~\ref{tab:test}), so extra passes are not sufficient for a model trained with informative thoughts. Whether a model trained with pause tokens could learn to use them is still open~\cite{goyal2024pause,pfau2024dots}. (iii) Checkpoint selection: test accuracy confirms the validation result for Latent Mamba, and the baselines fall further on test, so selection does not explain the gap.
 
 % =========================================================================
 \section{Related work}
@@ -604,7 +673,7 @@ The following explanations are hypotheses. The pending ablations and controls ar
 \section{Limitations}
 % =========================================================================
 
-\textbf{Preliminary evidence:} the results come from one dataset, one seed and the validation split, and the controls in Table~\ref{tab:pending} are not yet complete. ProsQA is synthetic: test graphs are new, but they share the training distribution. \textbf{Sequential training:} each thought depends on the previous output, so thoughts cannot use the parallel scan, and training throughput halves at six thoughts; parallel training of nonlinear recurrences~\cite{aviss2026sst} may help. \textbf{Fixed-size memory cuts both ways:} thinking cannot restore prompt details the state has already lost, so recall-heavy tasks may need hybrid attention layers, with thoughts kept out of their KV cache. \textbf{Interpretability:} thoughts are not text, and decoding them through $W$ is only a probe. \textbf{Halting collapse:} the head can learn to always stop early, so $\beta$ and $\lambda_p$ need tuning.
+\textbf{Narrow evidence:} one synthetic dataset, one seed and one model size. Test graphs are new but share the training distribution, and ProsQA is close to saturated, so it cannot separate strong methods; the controls of Section~\ref{sec:remaining} are missing. \textbf{Halting:} the learned head matches a fixed budget of three but adapts little to difficulty, and the convergence rule never fires; ProsQA's narrow range of difficulty (3 to 6 steps) may be part of the reason. \textbf{Speed:} each thought depends on the previous output, so thoughts cannot use the parallel scan. Training throughput halves at six thoughts, and the reference implementation decodes thoughts 3--5$\times$ slower than GPT-2. Parallel training of nonlinear recurrences~\cite{aviss2026sst} and fused single-step kernels may help. \textbf{Fixed-size memory cuts both ways:} thinking cannot restore prompt details the state has already lost, so recall-heavy tasks may need hybrid attention layers, with thoughts kept out of their KV cache. \textbf{Interpretability:} thoughts are not text, and decoding them through $W$ is only a probe.
 
 % =========================================================================
 \section{Conclusion}
@@ -612,9 +681,9 @@ The following explanations are hypotheses. The pending ablations and controls ar
 
 In a selective SSM, extra depth with a shared state is the same thing as extra time. Latent Mamba uses this to let a Mamba-2 model think in continuous space for as long as each input requires, at constant memory and with well under 1\% more parameters. Thoughts reuse the backbone unchanged, so the method needs no new kernels, trains from public pretrained checkpoints, and scores every thinking budget in one batched pass during halting training, which a growing KV cache would make expensive.
 
-The first experiment supports the idea. On ProsQA, a pretrained 130M Mamba-2 fine-tuned with the curriculum answers 98.7\% of validation questions while reasoning entirely in latent space, far above the same model writing its reasoning (74.3\%) or answering directly (80.0\%), and in the range Coconut reports for GPT-2. The gain appears only once several reasoning steps are latent and holds across problem lengths, which fits the view that continuous thoughts let the model keep several candidate paths alive instead of committing to one written chain. Training stayed stable through all stages, and the main cost is speed: each thought is a sequential pass, so throughput halves at six thoughts.
+The experiment supports the idea on held-out data. On ProsQA, a pretrained 130M Mamba-2 fine-tuned with the curriculum answers 99.0\% of test questions while reasoning entirely in latent space, against 70.8\% when the same model writes its reasoning and 74.6\% when it answers directly, and in the range Coconut reports for GPT-2. The thoughts carry the reasoning: with their content zeroed or replaced by noise, accuracy falls to 76--77\%, close to answering without thoughts. A single thought already recovers most of the gain, accuracy saturates at five, and twice the training budget costs under a point. The learned halting head stops after about three thoughts at almost no loss of accuracy, halving inference compute. On GPU, the state stayed at 18.2\,MiB for budgets up to 4{,}096 thoughts, a length GPT-2 cannot reach.
 
-These results are preliminary: one dataset, one seed and validation accuracy. The claim that the \emph{thoughts} carry the reasoning, rather than extra training or extra computation, rests on measurements that are still running or planned. If zeroing the thoughts at test time leaves accuracy high, or a pause-token model trained the same way matches Latent Mamba, the explanation in Section~\ref{sec:discussion} would be wrong. The next steps are the test-set evaluation with thought ablations, learned halting and measured memory; the matched Transformer baseline; the controls for training length and pause tokens; more seeds; and ProntoQA and the harder GSM8k benchmark, where Coconut trailed written chain-of-thought and Latent Mamba faces its most demanding test.
+The results also mark the limits of the current evidence. Halting finds a good budget but matches a fixed budget of three rather than adapting strongly to each question. At this scale and reasoning length, the reference implementation is slower than a Transformer and uses more peak memory, so the constant-memory advantage is structural rather than yet practical. Everything rests on one seed of one synthetic task. The next steps are the matched Coconut GPT-2 baseline; trained pause-token and training-length controls; more seeds and model sizes; a fused single-step kernel; tasks with long reasoning, where a constant-size state should matter most; and ProntoQA and the harder GSM8k benchmark, where Coconut trailed written chain-of-thought and Latent Mamba faces its most demanding test.
 
 % =========================================================================
 \begin{thebibliography}{99}

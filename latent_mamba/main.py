@@ -93,28 +93,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-__all__ = [
-    "IGNORE_INDEX",
-    "LatentMambaConfig",
-    "RMSNorm",
-    "LayerState",
-    "MambaCache",
-    "ssd_chunked_scan",
-    "ssd_step",
-    "Mamba2Mixer",
-    "ResidualBlock",
-    "MambaBackbone",
-    "ThoughtProjector",
-    "HaltingHead",
-    "LatentLossOutput",
-    "PonderLossOutput",
-    "GenerationOutput",
-    "LatentMamba",
-    "PointerChasingTask",
-    "self_test",
-    "run_demo",
-]
-
 IGNORE_INDEX: int = -100
 """Target value that is excluded from every loss (padding in target tensors)."""
 

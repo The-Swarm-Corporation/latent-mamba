@@ -14,7 +14,7 @@
 #   HF_TOKEN       Hugging Face write token. Without it nothing is uploaded.
 #   HF_REPO        upload target                                                  (default kye/latent-mamba)
 #   WANDB_API_KEY  turns on Weights & Biases logging (also WANDB_PROJECT, WANDB_ENTITY)
-#   TRAIN_ARGS     extra arguments for every train call, e.g. "--fused-scan --batch-size 16 --grad-accum 2"
+#   TRAIN_ARGS     extra arguments for every train call, e.g. "--batch-size 16 --grad-accum 2"
 #   EVAL_ARGS      extra arguments for every eval call
 #   BENCH          1 runs the memory/latency benchmark                            (default 1)
 #   KEEP_ALIVE     1 sleeps when finished or failed, so the container is not restarted (default 1)

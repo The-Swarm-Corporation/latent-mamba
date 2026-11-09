@@ -6,8 +6,9 @@
 # The container runs scripts/run_pipeline.sh, configured through environment
 # variables (MODEL, DATASET, HF_TOKEN, WANDB_API_KEY, ...). See docs/RUNPOD.md.
 #
-# Build with --build-arg INSTALL_MAMBA_SSM=1 to compile mamba_ssm's fused scan
-# kernels (adds ~20 min to the build). Then add --fused-scan to TRAIN_ARGS.
+# The image includes mamba_ssm's fused scan kernels, which training uses by
+# default on the GPU (compiling them can add ~20 min to the build). Build with
+# --build-arg INSTALL_MAMBA_SSM=0 to skip them; the reference scan is then used.
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
 
 ENV PYTHONUNBUFFERED=1 \
@@ -28,7 +29,7 @@ COPY pyproject.toml uv.lock README.md LICENSE ./
 # Install into the image's Python, reusing its CUDA build of PyTorch.
 RUN uv pip install --system -r pyproject.toml --extra train
 
-ARG INSTALL_MAMBA_SSM=0
+ARG INSTALL_MAMBA_SSM=1
 RUN if [ "$INSTALL_MAMBA_SSM" = "1" ]; then \
         uv pip install --system packaging ninja && uv pip install --system --no-build-isolation mamba-ssm; \
     fi
