@@ -151,6 +151,7 @@ The demo is a smoke test of the pipeline, not a benchmark. Real benchmark result
 
 
 ## Links
+
 |---|---|
 | Paper | [docs/paper.pdf](docs/paper.pdf) · LaTeX source [docs/latent_mamba.tex](docs/latent_mamba.tex) |
 | Model | [latent_mamba/main.py](latent_mamba/main.py) |
