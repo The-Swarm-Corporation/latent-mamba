@@ -18,6 +18,14 @@ train = [
     "wandb==0.19.5",
     "setuptools",  # provides distutils, which wandb 0.19 imports
 ]
+# Fused CUDA kernels: mamba_ssm's chunked scan and single step, and
+# causal-conv1d's single-token conv. Linux + CUDA only; the code falls back to
+# the reference kernels without them. Install after the rest, so the build
+# sees the installed torch:  uv sync --extra train && uv sync --extra train --extra cuda
+cuda = [
+    "mamba-ssm==2.3.1; sys_platform == 'linux'",
+    "causal-conv1d==1.7.0; sys_platform == 'linux'",
+]
 
 [project.urls]
 Repository = "https://github.com/The-Swarm-Corporation/latent-mamba"
@@ -31,3 +39,20 @@ dev = ["pyflakes>=3.2"]
 # The code runs as scripts (`uv run latent_mamba/train.py ...`), so there is
 # nothing to build or install: uv only manages the environment.
 package = false
+
+# mamba-ssm and causal-conv1d ship only as source and need torch to build.
+# Their metadata is given here so locking (also on macOS) never builds them,
+# and they are built against the torch already installed in the environment.
+[[tool.uv.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.1"
+requires-dist = ["torch", "triton", "ninja", "einops", "transformers", "packaging", "setuptools>=61.0.0"]
+
+[[tool.uv.dependency-metadata]]
+name = "causal-conv1d"
+version = "1.7.0"
+requires-dist = ["torch", "packaging", "ninja"]
+
+[tool.uv.extra-build-dependencies]
+mamba-ssm = [{ requirement = "torch", match-runtime = true }, "packaging", "ninja", "wheel"]
+causal-conv1d = [{ requirement = "torch", match-runtime = true }, "packaging", "ninja", "wheel"]

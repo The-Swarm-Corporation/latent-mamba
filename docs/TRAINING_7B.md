@@ -91,7 +91,7 @@ flowchart LR
 3. **Mechanics.** Scan the text up to the insertion point, run `<bot>`, then n calls of `thought_step`, then `<eot>`, then resume the scan from the resulting state. `main.py` already supports every piece: the chunked scan accepts an initial state, and `thought_step` takes and returns the state.
 4. **Loss.** Standard next-token cross-entropy on every real token. `<bot>`, `<eot>` and thought positions produce no loss.
 
-**Cost.** K × n ≈ 16 sequential single-token steps per sequence, against one parallel scan of 4,096 tokens. With the fused single-step kernel (Section 7) we expect about 20–30% overhead; without it, more. Measure this in stage 0.
+**Cost.** K × n ≈ 16 sequential single-token steps per sequence, against one parallel scan of 4,096 tokens. With the compiled thought step (Section 7) we expect about 20–30% overhead; without it, more. Measure this in stage 0.
 
 ### 5.2 Halting
 
@@ -141,7 +141,8 @@ A new `latent_mamba/pretrain.py`, separate from the fine-tuning pipeline in `tra
 | Parallelism | data parallel; ~21 GB of weights, gradients and AdamW state fit on every GPU | FSDP2 (`fully_shard`); ~117 GB of state, ~2 GB per GPU on 64 GPUs | 16 bytes per parameter for fp32 master weights, gradients and Adam moments |
 | Precision | bf16 autocast, scan in float32 | same | as in `train.py` |
 | Sequence scan | `mamba_ssm` fused chunked scan | same | already the default on CUDA, checked against the reference at startup |
-| Thought steps | `mamba_ssm` `selective_state_update` fused single-step kernel + CUDA graphs for the thought loop | same | **new**; the main speed lever, verified against `ssd_step` at startup like the scan |
+| Thought steps, training | `torch.compile` of the thought step (implemented); CUDA graphs over forward and backward (`--compile-thoughts cudagraphs`, experimental) | same | the fused single-step kernel has no backward pass, so training cannot use it; checked against eager at startup |
+| Thought steps, inference | `mamba_ssm` `selective_state_update` + `causal_conv1d_update` + CUDA graphs (implemented) | same | checked against the reference at startup |
 | B/C groups | 1 (works today) | 8 | **new** in `main.py`; the memory-saving scan rewrite assumes 1 group; verify against the reference recurrence |
 | Checkpoint loading | `state-spaces` format (works today) | HF Transformers `Mamba2ForCausalLM` format (Codestral); Megatron conversion (NVIDIA) | **new** loaders; names differ slightly (`embeddings` vs `embedding`) |
 | Activation memory | checkpoint each layer, per segment between thought spans | same | as in `enable_grad_checkpointing` |
@@ -240,7 +241,7 @@ flowchart LR
 | Risk | Sign | Mitigation |
 |---|---|---|
 | The model learns to ignore its thoughts | thought utility stays near zero | stop at gate 1; place spans at sentence and step boundaries; raise the reasoning-trace share; up-weight the loss right after spans |
-| Thoughts are too slow to train at scale | measured overhead > 2× in stage 0 | fused single-step kernel and CUDA graphs first; fewer spans per sequence (K = 2) |
+| Thoughts are too slow to train at scale | measured overhead > 2× in stage 0 | compiled thought step with CUDA graphs over forward and backward (`--compile-thoughts cudagraphs`); fewer spans per sequence (K = 2) |
 | Forgetting general ability | general-text loss and lm-eval scores drop | lower peak learning rate; more general-text replay; shorter re-warmup |
 | Halting collapses to always stop or never stop | mean thoughts pinned at 1 or N | tune λp and β; enable halting later in training |
 | Training instability at 7B | loss spikes | lower learning rate, longer warmup, gradient clipping, skip batches with abnormal gradient norm |
@@ -252,7 +253,7 @@ flowchart LR
 
 | Weeks | Work | Spend |
 |---|---|---|
-| 1–3 | `pretrain.py`, data pipeline, fused single-step kernel; stage 0 on 130M | ~$100 |
+| 1–3 | `pretrain.py` and data pipeline; stage 0 on 130M | ~$100 |
 | 4 | stage 1: 1.3B pilot, three runs; downstream fine-tuning | ~$1–1.5k |
 | 5–6 | stage 2: 1.3B main, three runs; downstream with 3 seeds; write up | ~$3–6k |
 | 5–8 (parallel) | 8-group support, HF and Megatron loaders, FSDP2; validate on 2.7B | ~$500 |

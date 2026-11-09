@@ -18,6 +18,8 @@
 #   EVAL_ARGS      extra arguments for every eval call
 #   BENCH          1 runs the memory/latency benchmark                            (default 1)
 #   KEEP_ALIVE     1 sleeps when finished or failed, so the container is not restarted (default 1)
+#   FUSED          1 installs mamba_ssm and causal-conv1d when a CUDA GPU is present and they
+#                  are missing, for the fused kernels train.py then uses automatically (default 1)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -48,6 +50,24 @@ finish() {
   fi
 }
 trap 'finish "pipeline FAILED at line $LINENO (log: $WORKDIR/logs/pipeline-$DATASET-$MODEL.log)"' ERR
+
+# Fused kernels: train.py uses mamba_ssm (scan, single step) and causal-conv1d (single-token
+# conv) automatically on CUDA when installed, each checked against the reference at startup.
+# Versions match the `cuda` extra in pyproject.toml.
+FUSED=${FUSED:-1}
+if [ "$FUSED" = 1 ] && python -c "import sys, torch; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+  if python -c "import mamba_ssm, causal_conv1d" 2>/dev/null; then
+    echo "mamba_ssm and causal_conv1d found: fused kernels on"
+  else
+    echo "CUDA detected, installing mamba_ssm and causal-conv1d for the fused kernels (can take ~20 min if they compile)"
+    if [ -n "${VIRTUAL_ENV:-}" ] && command -v uv >/dev/null 2>&1; then PIP=(uv pip install); else PIP=(python -m pip install); fi
+    if "${PIP[@]}" packaging ninja wheel setuptools && "${PIP[@]}" --no-build-isolation mamba-ssm==2.3.1 causal-conv1d==1.7.0; then
+      echo "fused kernels installed"
+    else
+      echo "warning: could not install the fused kernels, using the reference implementation"
+    fi
+  fi
+fi
 
 FLAGS=()
 if [ -n "${HF_TOKEN:-}" ]; then

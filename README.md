@@ -30,6 +30,7 @@ $ git clone https://github.com/The-Swarm-Corporation/latent-mamba
 $ cd latent-mamba
 $ uv sync                  # model only (PyTorch)
 $ uv sync --extra train    # plus the training pipeline
+$ uv sync --extra train --extra cuda   # plus fused CUDA kernels (Linux + NVIDIA GPU; run after the line above)
 ```
 
 Uses [uv](https://docs.astral.sh/uv/) with a locked environment (`uv.lock`). Requires Python >= 3.10 and PyTorch >= 2.4. Run code with `uv run`, e.g. `uv run latent_mamba/train.py --help`.
@@ -225,7 +226,7 @@ Useful flags
 
 - `--batch-size 16 --grad-accum 2` if a GPU runs out of memory
 - `--wandb` logs to [Weights & Biases](https://wandb.ai/apacai/latent-mamba)
-- on CUDA the fused `mamba_ssm` scan is used automatically when installed (`pip install mamba-ssm --no-build-isolation`); `--no-fused-scan` turns it off
+- on a CUDA GPU the fast paths are on by default, each checked against the reference at startup: the fused `mamba_ssm` scan (`--no-fused-scan`), training thoughts compiled with `torch.compile` (`--compile-thoughts off`, or `cudagraphs`, experimental), and inference thoughts and decoding through fused single-step kernels replayed as CUDA graphs (`--no-cuda-graphs`). They need the `cuda` extra; the pipeline installs it if missing
 - `uv run latent_mamba/train.py train --help` lists everything
 
 [`scripts/run_pipeline.sh`](scripts/run_pipeline.sh) runs the whole thing for one model and dataset (data, the three runs, test evaluation, benchmark, upload), and the [`Dockerfile`](Dockerfile) wraps it.

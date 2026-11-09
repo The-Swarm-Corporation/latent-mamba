@@ -6,9 +6,10 @@
 # The container runs scripts/run_pipeline.sh, configured through environment
 # variables (MODEL, DATASET, HF_TOKEN, WANDB_API_KEY, ...). See docs/RUNPOD.md.
 #
-# The image includes mamba_ssm's fused scan kernels, which training uses by
-# default on the GPU (compiling them can add ~20 min to the build). Build with
-# --build-arg INSTALL_MAMBA_SSM=0 to skip them; the reference scan is then used.
+# The image includes the fused CUDA kernels (mamba_ssm, causal-conv1d; the `cuda`
+# extra in pyproject.toml), which the code uses by default on the GPU (compiling
+# them can add ~20 min to the build). Build with --build-arg INSTALL_MAMBA_SSM=0
+# to skip them; the reference implementation is then used.
 FROM pytorch/pytorch:2.8.0-cuda12.8-cudnn9-devel
 
 ENV PYTHONUNBUFFERED=1 \
@@ -31,7 +32,7 @@ RUN uv pip install --system -r pyproject.toml --extra train
 
 ARG INSTALL_MAMBA_SSM=1
 RUN if [ "$INSTALL_MAMBA_SSM" = "1" ]; then \
-        uv pip install --system packaging ninja && uv pip install --system --no-build-isolation mamba-ssm; \
+        uv pip install --system packaging ninja && uv pip install --system --no-build-isolation mamba-ssm==2.3.1 causal-conv1d==1.7.0; \
     fi
 
 COPY latent_mamba/ latent_mamba/

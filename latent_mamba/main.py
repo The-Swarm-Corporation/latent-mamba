@@ -83,8 +83,6 @@ Requires Python >= 3.10 and PyTorch >= 2.1.
 from __future__ import annotations
 
 import math
-import random
-import time
 from dataclasses import dataclass
 from typing import Callable, Literal, Sequence
 
@@ -158,6 +156,7 @@ class LatentMambaConfig:
     halt_detach_input: bool = False
 
     def __post_init__(self) -> None:
+        """Reject widths, special-token ids, and a halt prior that cannot train."""
         if self.d_inner % self.headdim != 0:
             raise ValueError(
                 f"d_inner={self.d_inner} must be divisible by headdim={self.headdim}"
@@ -199,11 +198,13 @@ class RMSNorm(nn.Module):
     """
 
     def __init__(self, dim: int, eps: float = 1e-5, init: float = 1.0) -> None:
+        """Learned per-channel scale over the last dimension of size ``dim``."""
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.full((dim,), float(init)))
 
     def forward(self, x: Tensor, gate: Tensor | None = None) -> Tensor:
+        """Return RMS-normalised ``x``, multiplied by ``silu(gate)`` when a gate is given."""
         if gate is not None:
             x = x * F.silu(gate)
         compute_dtype = torch.promote_types(
@@ -239,6 +240,7 @@ class LayerState:
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
     ) -> LayerState:
+        """A zero conv window and a zero SSM state for one layer."""
         return cls(
             conv=torch.zeros(
                 batch_size,
@@ -277,6 +279,7 @@ class MambaCache:
         device: torch.device | str | None = None,
         dtype: torch.dtype = torch.float32,
     ) -> MambaCache:
+        """A zero state for every layer."""
         return cls(
             [
                 LayerState.zeros(config, batch_size, device, dtype)
@@ -286,6 +289,7 @@ class MambaCache:
 
     @property
     def batch_size(self) -> int:
+        """Number of examples stored in this cache."""
         return self.layers[0].ssm.shape[0]
 
     def where(self, mask: Tensor, other: MambaCache) -> MambaCache:
@@ -401,7 +405,9 @@ def ssd_chunked_scan(
     xs = xs.reshape(bsz, n_chunks, chunk, n_heads, headdim)
     bs = bs.reshape(bsz, n_chunks, chunk, d_state)
     cs = cs.reshape(bsz, n_chunks, chunk, d_state)
-    a_dt = a_dt.reshape(bsz, n_chunks, chunk, n_heads).permute(0, 3, 1, 2)  # (b, h, c, l)
+    a_dt = a_dt.reshape(bsz, n_chunks, chunk, n_heads).permute(
+        0, 3, 1, 2
+    )  # (b, h, c, l)
     a_cumsum = torch.cumsum(a_dt, dim=-1)
 
     # 1. Intra-chunk outputs (diagonal blocks): (c_l . b_s) * decay(l <- s) * x_s.
@@ -451,6 +457,29 @@ def ssd_step(
     return y, new_state
 
 
+def conv_step(
+    x: Tensor, conv_state: Tensor, weight: Tensor, bias: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Single-token causal depthwise conv followed by SiLU.
+
+    Same computation as the sequence path of :class:`Mamba2Mixer` with L=1.
+    Like ``ssd_step``, it is a module-level function so a fused kernel can
+    replace it.
+
+    Args:
+        x: (B, C), the new conv input.
+        conv_state: (B, C, d_conv - 1), the previous inputs.
+        weight: (C, 1, d_conv) depthwise kernel.
+        bias: (C,)
+
+    Returns:
+        ``(y, new_conv_state)`` with shapes (B, C) and (B, C, d_conv - 1).
+    """
+    window = torch.cat([conv_state, x.unsqueeze(-1)], dim=-1)  # (B, C, d_conv)
+    y = F.conv1d(window, weight, bias, groups=window.shape[1])[..., 0]
+    return F.silu(y), window[..., 1:]
+
+
 # --------------------------------------------------------------------------- #
 # Mamba-2 backbone
 # --------------------------------------------------------------------------- #
@@ -471,6 +500,7 @@ class Mamba2Mixer(nn.Module):
     """
 
     def __init__(self, config: LatentMambaConfig) -> None:
+        """In-projection, causal conv, SSM parameters, gated norm, and out-projection."""
         super().__init__()
         self.config = config
         d_in_proj = 2 * config.d_inner + 2 * config.d_state + config.n_heads
@@ -501,6 +531,7 @@ class Mamba2Mixer(nn.Module):
     def forward(
         self, u: Tensor, state: LayerState | None = None, mask: Tensor | None = None
     ) -> tuple[Tensor, LayerState]:
+        """Mix ``u`` starting from ``state`` and return ``(out, new_state)``."""
         cfg = self.config
         bsz, seqlen, _ = u.shape
         if state is None:
@@ -514,14 +545,20 @@ class Mamba2Mixer(nn.Module):
             xbc = xbc * keep
 
         # Causal depthwise conv, continuing from the stored window.
-        window = torch.cat(
-            [state.conv, xbc.transpose(1, 2)], dim=-1
-        )  # (B, C, d_conv - 1 + L)
-        new_conv = window[..., -(cfg.d_conv - 1) :]
-        xbc = F.conv1d(
-            window, self.conv1d.weight, self.conv1d.bias, groups=cfg.conv_dim
-        )
-        xbc = F.silu(xbc).transpose(1, 2)  # (B, L, C)
+        if seqlen == 1 and keep is None:  # a thought or a decoded token
+            xbc, new_conv = conv_step(
+                xbc[:, 0], state.conv, self.conv1d.weight, self.conv1d.bias
+            )
+            xbc = xbc.unsqueeze(1)  # (B, 1, C)
+        else:
+            window = torch.cat(
+                [state.conv, xbc.transpose(1, 2)], dim=-1
+            )  # (B, C, d_conv - 1 + L)
+            new_conv = window[..., -(cfg.d_conv - 1) :]
+            xbc = F.conv1d(
+                window, self.conv1d.weight, self.conv1d.bias, groups=cfg.conv_dim
+            )
+            xbc = F.silu(xbc).transpose(1, 2)  # (B, L, C)
 
         x, b, c = torch.split(xbc, [cfg.d_inner, cfg.d_state, cfg.d_state], dim=-1)
         x = x.reshape(bsz, seqlen, cfg.n_heads, cfg.headdim)
@@ -545,6 +582,7 @@ class ResidualBlock(nn.Module):
     """Pre-norm residual block: ``x + mixer(norm(x))``."""
 
     def __init__(self, config: LatentMambaConfig) -> None:
+        """Pre-norm and one :class:`Mamba2Mixer`."""
         super().__init__()
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps)
         self.mixer = Mamba2Mixer(config)
@@ -552,6 +590,7 @@ class ResidualBlock(nn.Module):
     def forward(
         self, x: Tensor, state: LayerState | None = None, mask: Tensor | None = None
     ) -> tuple[Tensor, LayerState]:
+        """Return ``(x + mixer(norm(x)), new_state)``."""
         out, new_state = self.mixer(self.norm(x), state, mask)
         return x + out, new_state
 
@@ -564,6 +603,7 @@ class MambaBackbone(nn.Module):
     """
 
     def __init__(self, config: LatentMambaConfig) -> None:
+        """Token embedding, ``n_layers`` residual blocks, and a final RMSNorm."""
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
@@ -618,6 +658,7 @@ class ThoughtProjector(nn.Module):
     """
 
     def __init__(self, config: LatentMambaConfig) -> None:
+        """Identity projection plus a zero mode embedding, scaled like a token."""
         super().__init__()
         self.norm = RMSNorm(config.d_model, eps=config.norm_eps, init=config.init_std)
         self.proj = nn.Linear(config.d_model, config.d_model, bias=False)
@@ -629,6 +670,7 @@ class ThoughtProjector(nn.Module):
         return self.proj(self.norm(h))
 
     def forward(self, h: Tensor) -> Tensor:
+        """Continuous thought embedding, shape (..., d_model)."""
         return self.content(h) + self.mode_embedding
 
     @torch.no_grad()
@@ -649,6 +691,7 @@ class HaltingHead(nn.Module):
     """
 
     def __init__(self, config: LatentMambaConfig) -> None:
+        """Two-layer MLP whose initial output is ``logit(halt_prior)`` everywhere."""
         super().__init__()
         hidden = config.halt_hidden or max(16, config.d_model // 4)
         self.fc1 = nn.Linear(config.d_model, hidden)
@@ -716,6 +759,130 @@ class GenerationOutput:
 
 
 # --------------------------------------------------------------------------- #
+# CUDA graphs for single steps
+# --------------------------------------------------------------------------- #
+
+
+def _tensors(tree: object) -> list[Tensor]:
+    """Tensors in a nested structure of tuples, lists, MambaCache and LayerState, in order."""
+    if isinstance(tree, Tensor):
+        return [tree]
+    if isinstance(tree, MambaCache):
+        return [t for s in tree.layers for t in (s.conv, s.ssm)]
+    if isinstance(tree, LayerState):
+        return [tree.conv, tree.ssm]
+    if isinstance(tree, (tuple, list)):
+        return [t for item in tree for t in _tensors(item)]
+    raise TypeError(f"unsupported type in a graphed step: {type(tree).__name__}")
+
+
+def _map_tensors(tree: object, fn: Callable[[Tensor], Tensor]) -> object:
+    """Same structure as ``tree``, with ``fn`` applied to every tensor."""
+    if isinstance(tree, Tensor):
+        return fn(tree)
+    if isinstance(tree, MambaCache):
+        return MambaCache([LayerState(fn(s.conv), fn(s.ssm)) for s in tree.layers])
+    if isinstance(tree, LayerState):
+        return LayerState(fn(tree.conv), fn(tree.ssm))
+    if isinstance(tree, (tuple, list)):
+        return type(tree)(_map_tensors(item, fn) for item in tree)
+    raise TypeError(f"unsupported type in a graphed step: {type(tree).__name__}")
+
+
+class _CUDAGraphStep:
+    """Captures ``fn(x, cache)`` as a CUDA graph per input signature and replays it.
+
+    Inputs are copied into static buffers before each replay, and outputs are
+    cloned out of the graph's memory afterwards, so callers can keep earlier
+    results (caches stay functional). Weights are read at replay time, so
+    parameter updates made in place are picked up. If a capture fails, or its
+    first replay disagrees with eager execution, the step runs eagerly from
+    then on.
+    """
+
+    def __init__(
+        self, fn: Callable[[Tensor, MambaCache], object], warmup: int = 2
+    ) -> None:
+        """Store ``fn`` and an empty graph table. ``warmup`` eager calls precede each capture."""
+        self.fn = fn
+        self.warmup = warmup
+        self.graphs: dict[tuple, tuple] = {}
+        self.disabled = False
+
+    def applies(self, x: Tensor) -> bool:
+        """True when ``x`` is a no-grad CUDA tensor and this step is still allowed to graph."""
+        return (
+            not self.disabled
+            and x.is_cuda
+            and not torch.is_grad_enabled()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    @staticmethod
+    def _autocast() -> tuple[bool, torch.dtype]:
+        """Current CUDA autocast flag and dtype, so a capture matches its caller."""
+        return torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
+
+    def _key(self, x: Tensor, cache: MambaCache) -> tuple:
+        """Signature of shapes, dtypes, devices, and autocast for one capture."""
+        return (
+            tuple((tuple(t.shape), t.dtype, t.device) for t in [x, *_tensors(cache)]),
+            self._autocast(),
+        )
+
+    def _capture(self, x: Tensor, cache: MambaCache) -> tuple:
+        """Warm up on a side stream, then record ``fn`` into static input and output buffers."""
+        static_x, static_cache = x.clone(), _map_tensors(cache, torch.clone)
+        enabled, dtype = self._autocast()
+        # Autocast must not reuse weight casts cached outside the graph.
+        amp = torch.autocast("cuda", dtype=dtype, enabled=enabled, cache_enabled=False)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side), amp:
+            for _ in range(self.warmup):
+                self.fn(static_x, static_cache)
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph), amp:
+            static_out = self.fn(static_x, static_cache)
+        return graph, static_x, static_cache, static_out
+
+    def _replay(self, entry: tuple, x: Tensor, cache: MambaCache) -> object:
+        """Copy inputs into the static buffers, replay the graph, and clone the outputs out."""
+        graph, static_x, static_cache, static_out = entry
+        static_x.copy_(x)
+        for dst, src in zip(_tensors(static_cache), _tensors(cache)):
+            dst.copy_(src)
+        graph.replay()
+        return _map_tensors(static_out, torch.clone)
+
+    def __call__(self, x: Tensor, cache: MambaCache) -> object:
+        """Replay a matching graph, or capture one and check it against eager execution."""
+        key = self._key(x, cache)
+        entry = self.graphs.get(key)
+        if entry is not None:
+            return self._replay(entry, x, cache)
+        try:
+            entry = self._capture(x, cache)
+            out = self._replay(entry, x, cache)
+            ref = self.fn(x, cache)
+            for a, b in zip(_tensors(out), _tensors(ref)):
+                err = (a.float() - b.float()).abs().max().item()
+                scale = b.float().abs().max().item()
+                if not err <= 1e-3 * max(scale, 1.0):
+                    raise RuntimeError(
+                        f"replay differs from eager execution (max abs err {err:.2e})"
+                    )
+        except Exception as exc:  # never let an optimisation change results
+            print(f"warning: CUDA graph disabled for this step: {exc}")
+            self.disabled = True
+            self.graphs.clear()
+            return self.fn(x, cache)
+        self.graphs[key] = entry
+        return ref
+
+
+# --------------------------------------------------------------------------- #
 # The model
 # --------------------------------------------------------------------------- #
 
@@ -734,6 +901,7 @@ class LatentMamba(nn.Module):
     """
 
     def __init__(self, config: LatentMambaConfig) -> None:
+        """Backbone, thought projector, halting head, and language-model head."""
         super().__init__()
         self.config = config
         self.backbone = MambaBackbone(config)
@@ -742,6 +910,29 @@ class LatentMamba(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         if config.tie_embeddings:
             self.lm_head.weight = self.backbone.embedding.weight
+        self._cuda_graphs: dict[str, _CUDAGraphStep] = {}
+
+    def enable_cuda_graphs(self, enabled: bool = True) -> None:
+        """Replay thought and decode steps as CUDA graphs during inference.
+
+        A single step launches dozens of small kernels per layer, so at small
+        batch sizes its cost is mostly launch overhead. With graphs, each step
+        shape is captured once and then replayed as one launch. Only no-grad
+        CUDA calls without an ablation use the graphs; everything else runs
+        eagerly, and the first replay of every capture is checked against
+        eager execution. Results are returned as fresh tensors, so caches stay
+        functional.
+        """
+        self._cuda_graphs = (
+            {
+                "thought": _CUDAGraphStep(
+                    lambda h, cache: self._thought_step(h, cache)
+                ),
+                "decode": _CUDAGraphStep(self._decode_step),
+            }
+            if enabled
+            else {}
+        )
 
     # ----- basic passes -------------------------------------------------- #
 
@@ -785,6 +976,35 @@ class LatentMamba(nn.Module):
         return hidden[:, -1], cache
 
     def thought_step(
+        self, h: Tensor, cache: MambaCache, ablate: Ablation | None = None
+    ) -> tuple[Tensor, MambaCache, Tensor]:
+        """Take one continuous thought.
+
+        Same as :meth:`_thought_step`, replayed as a CUDA graph when
+        :meth:`enable_cuda_graphs` is on and the call allows it.
+        """
+        graph = self._cuda_graphs.get("thought") if ablate is None else None
+        if graph is not None and graph.applies(h):
+            return graph(h, cache)
+        return self._thought_step(h, cache, ablate)
+
+    def decode_step(
+        self, token_ids: Tensor, cache: MambaCache
+    ) -> tuple[Tensor, MambaCache]:
+        """One decoding step: ``(logits (B, V), new_cache)`` for ``token_ids`` (B, 1)."""
+        graph = self._cuda_graphs.get("decode")
+        if graph is not None and graph.applies(token_ids):
+            return graph(token_ids, cache)
+        return self._decode_step(token_ids, cache)
+
+    def _decode_step(
+        self, token_ids: Tensor, cache: MambaCache
+    ) -> tuple[Tensor, MambaCache]:
+        """Eager decode of one token: last-position logits and the updated cache."""
+        logits, cache = self(token_ids, cache)
+        return logits[:, -1], cache
+
+    def _thought_step(
         self, h: Tensor, cache: MambaCache, ablate: Ablation | None = None
     ) -> tuple[Tensor, MambaCache, Tensor]:
         """Take one continuous thought.
@@ -1037,8 +1257,7 @@ class LatentMamba(nn.Module):
         finished = torch.zeros(bsz, dtype=torch.bool, device=device)
         generated: list[Tensor] = []
         for _ in range(max_new_tokens):
-            logits, cache = self(token, cache)
-            logits = logits[:, -1]
+            logits, cache = self.decode_step(token, cache)
             if temperature > 0:
                 next_token = torch.multinomial(
                     torch.softmax(logits / temperature, dim=-1), 1
@@ -1060,336 +1279,3 @@ class LatentMamba(nn.Module):
             torch.stack(generated, dim=1) if generated else prompt_ids.new_zeros(bsz, 0)
         )
         return GenerationOutput(tokens=tokens, n_thoughts=n_used)
-
-
-# --------------------------------------------------------------------------- #
-# Synthetic task for the demo
-# --------------------------------------------------------------------------- #
-
-
-class PointerChasingTask:
-    """k-hop pointer chasing over a permutation given in context.
-
-    Prompt: ``a_1 f(a_1) a_2 f(a_2) ... <sep> x <hop_k> <bot>`` with a fresh
-    random permutation f per example. The chain of thought is
-    ``f(x), f^2(x), ..., f^{k-1}(x)`` and the answer is ``f^k(x)``. More hops
-    need more sequential computation, which makes it a simple probe of
-    adaptive thinking.
-    """
-
-    def __init__(self, n_symbols: int = 6, max_hops: int = 3, seed: int = 0) -> None:
-        self.n_symbols = n_symbols
-        self.max_hops = max_hops
-        self.sep_id = n_symbols
-        self.bot_id = n_symbols + 1
-        self.eot_id = n_symbols + 2
-        self.pad_id = n_symbols + 3
-        self.hop_base = n_symbols + 4
-        self.vocab_size = n_symbols + 4 + max_hops
-        self.rng = random.Random(seed)
-
-    def sample(
-        self, batch_size: int, hops: int | None = None
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Draw a batch.
-
-        Returns:
-            ``(prompt_ids (B, 2S+4), chains (B, max_hops), hops (B,))``. Here
-            ``chains[i, :k]`` holds f(x) .. f^k(x) and the rest is ``IGNORE_INDEX``.
-        """
-        prompts: list[list[int]] = []
-        chains: list[list[int]] = []
-        hop_list: list[int] = []
-        for _ in range(batch_size):
-            perm = list(range(self.n_symbols))
-            self.rng.shuffle(perm)
-            order = list(range(self.n_symbols))
-            self.rng.shuffle(order)
-            x = self.rng.randrange(self.n_symbols)
-            k = hops if hops is not None else self.rng.randint(1, self.max_hops)
-            chain, v = [], x
-            for _ in range(k):
-                v = perm[v]
-                chain.append(v)
-            pairs = [tok for a in order for tok in (a, perm[a])]
-            prompts.append(pairs + [self.sep_id, x, self.hop_base + k - 1, self.bot_id])
-            chains.append(chain + [IGNORE_INDEX] * (self.max_hops - k))
-            hop_list.append(k)
-        return torch.tensor(prompts), torch.tensor(chains), torch.tensor(hop_list)
-
-    def stage_targets(
-        self, chains: Tensor, hops: Tensor, stage: int
-    ) -> tuple[Tensor, Tensor]:
-        """Coconut stage ``stage``: drop the first min(stage, k-1) CoT steps.
-
-        Returns:
-            ``(target_ids (B, max_hops), removed (B,))``. The caller turns
-            ``removed`` into ``c * removed`` thoughts.
-        """
-        removed = torch.clamp(hops - 1, max=stage).clamp(min=0)
-        targets = torch.full_like(chains, IGNORE_INDEX)
-        for i in range(chains.shape[0]):
-            k, r = int(hops[i]), int(removed[i])
-            targets[i, : k - r] = chains[i, r:k]
-        return targets, removed
-
-
-# --------------------------------------------------------------------------- #
-# Self-test and demo
-# --------------------------------------------------------------------------- #
-
-
-def self_test(device: str = "cpu", seed: int = 0) -> None:
-    """Numerical and functional checks. Raises AssertionError on failure."""
-    torch.manual_seed(seed)
-    cfg = LatentMambaConfig(
-        vocab_size=50,
-        bot_id=47,
-        eot_id=48,
-        pad_id=49,
-        d_model=64,
-        n_layers=2,
-        d_state=16,
-        headdim=16,
-        chunk_size=8,
-    )
-    model = LatentMamba(cfg).to(device).double()
-
-    # 1. Chunked scan (with padding and an initial state) matches the recurrence.
-    bsz, seqlen = 3, 21
-    x = torch.randn(
-        bsz, seqlen, cfg.n_heads, cfg.headdim, device=device, dtype=torch.double
-    )
-    dt = F.softplus(
-        torch.randn(bsz, seqlen, cfg.n_heads, device=device, dtype=torch.double)
-    )
-    a = -torch.rand(cfg.n_heads, device=device, dtype=torch.double) * 2
-    b = torch.randn(bsz, seqlen, cfg.d_state, device=device, dtype=torch.double)
-    c = torch.randn(bsz, seqlen, cfg.d_state, device=device, dtype=torch.double)
-    h0 = torch.randn(
-        bsz, cfg.n_heads, cfg.headdim, cfg.d_state, device=device, dtype=torch.double
-    )
-    y_scan, h_scan = ssd_chunked_scan(x, dt, a, b, c, cfg.chunk_size, h0)
-    state, ys = h0, []
-    for t in range(seqlen):
-        y_t, state = ssd_step(x[:, t], dt[:, t], a, b[:, t], c[:, t], state)
-        ys.append(y_t)
-    assert torch.allclose(
-        y_scan, torch.stack(ys, 1), atol=1e-9
-    ), "scan output != recurrence"
-    assert torch.allclose(h_scan, state, atol=1e-9), "scan final state != recurrence"
-
-    # 2. Prefill + token-by-token continuation matches one full forward pass.
-    ids = torch.randint(0, 47, (2, 19), device=device)
-    full_logits, _ = model(ids)
-    logits_a, cache = model(ids[:, :11])
-    step_logits = [logits_a]
-    for t in range(11, 19):
-        lg, cache = model(ids[:, t : t + 1], cache)
-        step_logits.append(lg)
-    assert torch.allclose(
-        full_logits, torch.cat(step_logits, 1), atol=1e-8
-    ), "cached decoding mismatch"
-    size_before = cache.num_bytes()
-
-    # 3. Thoughts leave the cache size unchanged and losses backpropagate.
-    prompt = torch.randint(0, 47, (4, 10), device=device)
-    prompt[:, -1] = cfg.bot_id
-    target = torch.randint(0, 47, (4, 3), device=device)
-    target[0, 2] = IGNORE_INDEX
-    h, cache = model.encode_prompt(prompt)
-    for _ in range(5):
-        h, cache, _ = model.thought_step(h, cache)
-    assert (
-        cache.num_bytes() == size_before * 2
-    ), "cache size should depend only on batch size"
-
-    out = model.latent_loss(
-        prompt, target, n_thoughts=torch.tensor([0, 1, 2, 3], device=device)
-    )
-    out.loss.backward()
-    assert torch.isfinite(out.loss)
-    assert (
-        model.thought_projector.proj.weight.grad is not None
-    ), "no gradient through thoughts"
-    model.zero_grad()
-
-    pout = model.ponder_loss(prompt, target, max_thoughts=4)
-    pout.loss.backward()
-    assert torch.allclose(
-        pout.halting_distribution.sum(1),
-        torch.ones(4, device=device, dtype=torch.double),
-    )
-    assert model.halting_head.fc2.weight.grad is not None, "no gradient to halting head"
-
-    # 4. Per-example thought counts: an example that stopped is frozen while others continue.
-    h2, c2 = model.encode_prompt(prompt[:2])
-    _, c_single, _ = model.thought_step(h2, c2)
-    _, c_mixed = model._run_thoughts(h2, c2, torch.tensor([1, 3], device=device))
-    assert torch.allclose(
-        c_mixed.layers[-1].ssm[0], c_single.layers[-1].ssm[0]
-    ), "stopped example changed"
-    assert not torch.allclose(
-        c_mixed.layers[-1].ssm[1], c_single.layers[-1].ssm[1]
-    ), "active example frozen"
-
-    # 5. Generation with every halting rule.
-    for rule in ("learned", "convergence", "fixed"):
-        gen = model.generate(prompt, max_new_tokens=3, max_thoughts=4, halt_rule=rule)
-        assert gen.tokens.shape == (4, 3) and int(gen.n_thoughts.max()) <= 4
-    gen = model.generate(prompt, max_new_tokens=2, max_thoughts=3, ablate="zeros")
-    assert gen.tokens.shape == (4, 2)
-
-    # 6. Left padding with a mask is exact: a padded row matches the same prompt run alone.
-    short = prompt[:, 4:]  # (4, 6), still ends with <bot>
-    padded = torch.cat([torch.full_like(prompt[:, :4], cfg.pad_id), short], dim=1)
-    pmask = torch.ones_like(padded, dtype=torch.bool)
-    pmask[:, :4] = False
-    padded[1:], pmask[1:] = prompt[1:], True  # mixed batch: only row 0 is padded
-    h_pad, c_pad = model.encode_prompt(padded, pmask)
-    h_ref, c_ref = model.encode_prompt(short[:1])
-    assert torch.allclose(
-        h_pad[:1], h_ref, atol=1e-9
-    ), "left padding changed the hidden state"
-    for lp, lr in zip(c_pad.layers, c_ref.layers):
-        assert torch.allclose(lp.ssm[:1], lr.ssm, atol=1e-9) and torch.allclose(
-            lp.conv[:1], lr.conv, atol=1e-9
-        )
-    h_full, _ = model.encode_prompt(prompt[1:])
-    assert torch.allclose(h_pad[1:], h_full, atol=1e-9), "mask changed unpadded rows"
-    print(
-        "self-test passed: scan == recurrence, cached decoding exact, O(1) state, gradients OK, padding exact"
-    )
-
-
-def _accuracy_by_hops(
-    model: LatentMamba,
-    task: PointerChasingTask,
-    n_eval: int,
-    device: torch.device,
-    **generate_kwargs: object,
-) -> dict[int, tuple[float, float]]:
-    """Return {hops: (accuracy, mean thoughts)} on fresh k-hop problems."""
-    results: dict[int, tuple[float, float]] = {}
-    for k in range(1, task.max_hops + 1):
-        prompts, chains, _ = task.sample(n_eval, hops=k)
-        prompts, chains = prompts.to(device), chains.to(device)
-        gen = model.generate(prompts, max_new_tokens=1, **generate_kwargs)  # type: ignore[arg-type]
-        acc = (gen.tokens[:, 0] == chains[:, k - 1]).float().mean().item()
-        results[k] = (acc, gen.n_thoughts.float().mean().item())
-    return results
-
-
-def run_demo(
-    steps_per_stage: int = 600,
-    ponder_steps: int = 800,
-    batch_size: int = 64,
-    thoughts_per_step: int = 2,
-    lr: float = 2e-3,
-    device: str | None = None,
-    seed: int = 0,
-) -> LatentMamba:
-    """Train a tiny Latent Mamba through every stage of the recipe.
-
-    The stages are language CoT, the Coconut curriculum, and PonderNet
-    halting. The task is pointer chasing, and the run reports accuracy and
-    thoughts used per hop count. This is a small-scale smoke test of the
-    pipeline, not a benchmark.
-    """
-    torch.manual_seed(seed)
-    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    task = PointerChasingTask(n_symbols=6, max_hops=3, seed=seed)
-    cfg = LatentMambaConfig(
-        vocab_size=task.vocab_size,
-        bot_id=task.bot_id,
-        eot_id=task.eot_id,
-        pad_id=task.pad_id,
-        d_model=128,
-        n_layers=4,
-        d_state=32,
-        headdim=32,
-        chunk_size=32,
-    )
-    model = LatentMamba(cfg).to(dev)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(
-        f"device={dev}  params={n_params / 1e6:.2f}M  task: {task.max_hops}-hop pointer chasing, "
-        f"{task.n_symbols} symbols"
-    )
-
-    def train(
-        label: str, steps: int, step_fn: Callable[[], tuple[Tensor, str]]
-    ) -> None:
-        opt = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=0.01
-        )  # reset per stage, as in Coconut
-        start = time.time()
-        for step in range(1, steps + 1):
-            loss, info = step_fn()
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
-            if step % max(1, steps // 4) == 0 or step == steps:
-                print(
-                    f"  [{label}] step {step:4d}/{steps}  loss {loss.item():.3f}  {info}  "
-                    f"({time.time() - start:.0f}s)"
-                )
-
-    c = thoughts_per_step
-    for stage in range(task.max_hops):
-
-        def coconut_step(stage: int = stage) -> tuple[Tensor, str]:
-            prompts, chains, hops = task.sample(batch_size)
-            targets, removed = task.stage_targets(chains, hops, stage)
-            out = model.latent_loss(
-                prompts.to(dev), targets.to(dev), (c * removed).to(dev)
-            )
-            return out.loss, f"mean thoughts {out.n_thoughts.float().mean().item():.2f}"
-
-        name = "language CoT" if stage == 0 else f"coconut stage {stage}"
-        train(name, steps_per_stage, coconut_step)
-
-    max_thoughts = c * (task.max_hops - 1) + 2
-
-    def ponder_step() -> tuple[Tensor, str]:
-        prompts, chains, hops = task.sample(batch_size)
-        targets, _ = task.stage_targets(chains, hops, task.max_hops)
-        out = model.ponder_loss(
-            prompts.to(dev), targets.to(dev), max_thoughts=max_thoughts, beta=0.01
-        )
-        means = [
-            out.expected_thoughts[hops.to(dev) == k].mean().item()
-            for k in range(1, task.max_hops + 1)
-        ]
-        return out.loss, "E[thoughts] by hops " + " / ".join(f"{m:.2f}" for m in means)
-
-    train("ponder halting", ponder_steps, ponder_step)
-
-    print(
-        "\nevaluation (500 fresh problems per hop count, chance = "
-        f"{1 / task.n_symbols:.2f})"
-    )
-    evals = {
-        "learned halting": dict(max_thoughts=max_thoughts, halt_rule="learned"),
-        "fixed max thoughts": dict(max_thoughts=max_thoughts, halt_rule="fixed"),
-        "no thoughts": dict(max_thoughts=0, halt_rule="fixed"),
-        "ablated (zeros)": dict(
-            max_thoughts=max_thoughts, halt_rule="learned", ablate="zeros"
-        ),
-    }
-    header = "  ".join(f"{k}-hop acc / thoughts" for k in range(1, task.max_hops + 1))
-    print(f"  {'mode':<20}{header}")
-    for label, kwargs in evals.items():
-        res = _accuracy_by_hops(model, task, 500, dev, **kwargs)
-        row = "  ".join(
-            f"{res[k][0]:>8.2f} / {res[k][1]:<9.2f}"
-            for k in range(1, task.max_hops + 1)
-        )
-        print(f"  {label:<20}{row}")
-    return model
-
-
-if __name__ == "__main__":
-    self_test()
-    run_demo()

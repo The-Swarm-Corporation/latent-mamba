@@ -35,7 +35,13 @@ from pathlib import Path
 
 import torch
 
-from train import decode_answer, install_scan, load_checkpoint, parse_answer
+from train import (
+    decode_answer,
+    enable_cuda_graphs,
+    install_scan,
+    load_checkpoint,
+    parse_answer,
+)
 
 DEFAULT_REPO = "kye/latent-mamba"
 DEFAULT_CKPT = "prosqa-mamba2-130m-latent/ponder.pt"
@@ -136,10 +142,14 @@ def default_settings(ckpt: dict) -> Settings:
 
 
 @torch.no_grad()
-def answer(model, bundle, question: str, s: Settings) -> tuple[str, list[Thought], float]:
+def answer(
+    model, bundle, question: str, s: Settings
+) -> tuple[str, list[Thought], float]:
     """Think, then decode the answer. Same rules as ``LatentMamba.generate``."""
     device = next(model.parameters()).device
-    ids = bundle.tokenizer(question.strip() + "\n", add_special_tokens=False)["input_ids"]
+    ids = bundle.tokenizer(question.strip() + "\n", add_special_tokens=False)[
+        "input_ids"
+    ]
     prompt = torch.tensor([ids + [bundle.bot_id]], device=device)
     t0 = time.perf_counter()
 
@@ -154,7 +164,9 @@ def answer(model, bundle, question: str, s: Settings) -> tuple[str, list[Thought
         survive *= 1.0 - lam
         top = model.lm_head(h).topk(s.top_k, dim=-1).indices[0].tolist()
         thoughts.append(
-            Thought(lam, 1.0 - survive, change, [bundle.tokenizer.decode([t]) for t in top])
+            Thought(
+                lam, 1.0 - survive, change, [bundle.tokenizer.decode([t]) for t in top]
+            )
         )
         if s.halt_rule == "learned" and 1.0 - survive >= s.halt_threshold:
             break
@@ -164,8 +176,8 @@ def answer(model, bundle, question: str, s: Settings) -> tuple[str, list[Thought
     token = torch.tensor([[bundle.eot_id]], device=device)
     out: list[int] = []
     for _ in range(s.max_new_tokens):
-        logits, cache = model(token, cache)
-        nxt = int(logits[0, -1].argmax())
+        logits, cache = model.decode_step(token, cache)
+        nxt = int(logits[0].argmax())
         out.append(nxt)
         if nxt == bundle.eos_id:
             break
@@ -177,8 +189,10 @@ def show_trace(thoughts: list[Thought]) -> None:
     for i, t in enumerate(thoughts, 1):
         tokens = " ".join(repr(x.strip() or x) for x in t.top_tokens)
         print(
-            dim(f"  thought {i}:  halt {t.p_halt:5.1%}  stopped {t.p_stopped:5.1%}  "
-                f"change {t.change:6.3f}  nearest tokens ")
+            dim(
+                f"  thought {i}:  halt {t.p_halt:5.1%}  stopped {t.p_stopped:5.1%}  "
+                f"change {t.change:6.3f}  nearest tokens "
+            )
             + cyan(tokens)
         )
 
@@ -203,12 +217,16 @@ def describe(s: Settings) -> str:
     )
 
 
-def run_question(model, bundle, question: str, s: Settings, gold: str | None = None) -> None:
+def run_question(
+    model, bundle, question: str, s: Settings, gold: str | None = None
+) -> None:
     text, thoughts, secs = answer(model, bundle, question, s)
     if s.trace and thoughts:
         show_trace(thoughts)
     reply = text.split("###")[-1].strip() if "###" in text else text.strip()
-    if "###" in text and text.split("###")[0].strip():  # CoT baseline: show its reasoning
+    if (
+        "###" in text and text.split("###")[0].strip()
+    ):  # CoT baseline: show its reasoning
         print(dim(text.split("###")[0].rstrip()))
     print(bold(reply or "(empty answer)"))
     meta = f"{len(thoughts)} thought{'s' if len(thoughts) != 1 else ''}, {secs:.2f}s"
@@ -225,7 +243,9 @@ def handle_command(line: str, s: Settings, examples: list[dict], model, bundle) 
     if cmd in ("quit", "exit", "q"):
         return False
     if cmd in ("help", "h", "?"):
-        print(__doc__.split("Type a question at the prompt, or a command:")[-1].rstrip())
+        print(
+            __doc__.split("Type a question at the prompt, or a command:")[-1].rstrip()
+        )
     elif cmd == "example":
         ex = random.choice(examples)
         print(dim("question: ") + ex["question"])
@@ -241,7 +261,10 @@ def handle_command(line: str, s: Settings, examples: list[dict], model, bundle) 
     elif cmd == "settings":
         pass
     else:
-        print(red(f"unknown command or bad argument: {line.strip()}") + dim("  (try /help)"))
+        print(
+            red(f"unknown command or bad argument: {line.strip()}")
+            + dim("  (try /help)")
+        )
         return True
     if cmd in ("thoughts", "halt", "trace", "ablate", "settings"):
         print(dim(describe(s)))
@@ -250,9 +273,13 @@ def handle_command(line: str, s: Settings, examples: list[dict], model, bundle) 
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Chat with a Latent Mamba checkpoint.")
-    p.add_argument("--ckpt", default=DEFAULT_CKPT, help="local path, or a file in --repo")
+    p.add_argument(
+        "--ckpt", default=DEFAULT_CKPT, help="local path, or a file in --repo"
+    )
     p.add_argument("--repo", default=DEFAULT_REPO, help="Hugging Face repo for --ckpt")
-    p.add_argument("--device", help="cpu, cuda or mps (default: cuda, then mps, then cpu)")
+    p.add_argument(
+        "--device", help="cpu, cuda or mps (default: cuda, then mps, then cpu)"
+    )
     p.add_argument("--max-thoughts", type=int, help="default: as trained")
     p.add_argument("--halt", choices=HALT_RULES, help="default: as trained")
     p.add_argument("--max-new-tokens", type=int)
@@ -262,10 +289,11 @@ def main() -> None:
     args = p.parse_args()
 
     device = pick_device(args.device)
-    install_scan(None, device)  # fused mamba_ssm kernel on CUDA when installed
+    install_scan(None, device)  # fused mamba_ssm kernels on CUDA when installed
     path = resolve_checkpoint(args.ckpt, args.repo)
     bundle, ckpt = load_checkpoint(path)
     model = bundle.model.to(device).eval()
+    enable_cuda_graphs(bundle, device, None)  # thought and decode steps as CUDA graphs on CUDA
 
     s = default_settings(ckpt)
     if args.max_thoughts is not None:
@@ -281,9 +309,12 @@ def main() -> None:
         return
 
     examples = load_examples(args.data_dir)
-    print(bold("Latent Mamba") + dim(f"  {ckpt.get('model_name')}, phase {ckpt.get('phase')}, on {device}"))
+    print(
+        bold("Latent Mamba")
+        + dim(f"  {ckpt.get('model_name')}, phase {ckpt.get('phase')}, on {device}")
+    )
     print(dim(describe(s)))
-    print(dim("Ask a ProsQA-style question: facts, then \"Is <name> a <X> or <Y>?\""))
+    print(dim('Ask a ProsQA-style question: facts, then "Is <name> a <X> or <Y>?"'))
     print(dim("/example for a test question, /help for commands, /quit to leave.\n"))
 
     while True:

@@ -66,7 +66,11 @@ Notes
   default. It is checked against the reference scan (outputs and gradients) on
   startup; if ``mamba_ssm`` is missing or disagrees, the reference scan is used
   instead. ``--fused-scan`` makes the kernel mandatory, ``--no-fused-scan``
-  turns it off.
+  turns it off. Inference thoughts and decoding also use mamba_ssm's fused
+  single-step kernel (and causal-conv1d's, if installed) and are replayed as
+  CUDA graphs (``--no-cuda-graphs`` turns that off). Training thoughts are
+  compiled with torch.compile (``--compile-thoughts``). Every fast path is
+  checked against the reference at startup and falls back to it on mismatch.
 * Multi-GPU runs use ``torchrun``. Gradients are all-reduced by hand rather
   than through DDP, because the losses are not ``forward`` calls and some
   parameters get no gradient in some stages.
@@ -678,7 +682,7 @@ def count_params(model: nn.Module) -> int:
 # Selective scan: float32 reference, or the fused mamba_ssm kernel
 # --------------------------------------------------------------------------- #
 
-_REF_SCAN, _REF_STEP = lm.ssd_chunked_scan, lm.ssd_step
+_REF_SCAN, _REF_STEP, _REF_CONV = lm.ssd_chunked_scan, lm.ssd_step, lm.conv_step
 
 
 def _scan_fp32(x, dt, a, b, c, chunk_size, initial_state=None):  # type: ignore[no-untyped-def]
@@ -696,10 +700,18 @@ def _scan_fp32(x, dt, a, b, c, chunk_size, initial_state=None):  # type: ignore[
 
 
 def _step_fp32(x, dt, a, b, c, state):  # type: ignore[no-untyped-def]
+    """Reference single step in float32, with as few dtype conversions as possible.
+
+    The state is kept in float32 and stays there. x and b are not cast: they
+    meet float32 dt and state in elementwise products, which promote to float32
+    inside the same kernel. Only c is cast, because einsum needs one dtype.
+    """
     with torch.autocast(x.device.type, enabled=False):
-        y, new_state = _REF_STEP(
-            x.float(), dt.float(), a.float(), b.float(), c.float(), state.float()
-        )
+        dt, state = dt.float(), state.float()  # no-ops when already float32
+        decay = torch.exp(dt * a.float())[..., None, None]
+        update = (dt.unsqueeze(-1) * x).unsqueeze(-1) * b[:, None, None, :]
+        new_state = state * decay + update
+        y = torch.einsum("bhpn,bn->bhp", new_state, c.to(new_state.dtype))
     return y.to(x.dtype), new_state
 
 
@@ -769,7 +781,12 @@ def enable_grad_checkpointing(bundle: Bundle) -> None:
     for layer in bundle.model.backbone.layers:
         forward = layer.forward
 
-        def wrapped(x: Tensor, state: Any = None, mask: Tensor | None = None, _forward: Any = forward) -> Any:
+        def wrapped(
+            x: Tensor,
+            state: Any = None,
+            mask: Tensor | None = None,
+            _forward: Any = forward,
+        ) -> Any:
             if torch.is_grad_enabled():
                 return checkpoint(_forward, x, state, mask, use_reentrant=False)
             return _forward(x, state, mask)
@@ -777,38 +794,258 @@ def enable_grad_checkpointing(bundle: Bundle) -> None:
         layer.forward = wrapped
 
 
-def install_scan(fused: bool | None, device: torch.device) -> bool:
-    """Choose the selective scan. Returns True if the fused kernel is in use.
+def _step_fused(x, dt, a, b, c, state):  # type: ignore[no-untyped-def]
+    """mamba_ssm's fused single-step kernel. It updates the state in place, so it
+    works on a copy and the old state stays valid (caches are functional)."""
+    from mamba_ssm.ops.triton.selective_state_update import selective_state_update
 
-    ``fused=None`` (the default) uses mamba_ssm's kernel on CUDA when it is
-    installed and passes the startup check, and the float32 reference scan
-    otherwise. ``True`` requires the kernel; ``False`` never uses it.
+    heads, headdim, d_state = state.shape[1:]
+    new_state = state.float().clone()
+    y = selective_state_update(
+        new_state,
+        x.contiguous(),
+        dt.float()[..., None].expand(-1, -1, headdim),
+        a.float()[:, None, None].expand(heads, headdim, d_state),
+        b[:, None, :].contiguous(),
+        c[:, None, :].contiguous(),
+        dt_softplus=False,
+    )
+    return y, new_state
+
+
+def _conv_fused(x, conv_state, weight, bias):  # type: ignore[no-untyped-def]
+    """causal_conv1d's fused single-token conv + SiLU, on a copy of the window."""
+    from causal_conv1d import causal_conv1d_update
+
+    new_state = conv_state.to(x.dtype).clone()
+    y = causal_conv1d_update(
+        x.contiguous(), new_state, weight[:, 0, :].to(x.dtype), bias.to(x.dtype), "silu"
+    )
+    return y, new_state
+
+
+def _step_dispatch(x, dt, a, b, c, state):  # type: ignore[no-untyped-def]
+    # the fused kernel has no backward pass: training thoughts use the reference
+    if torch.is_grad_enabled() or not x.is_cuda:
+        return _step_fp32(x, dt, a, b, c, state)
+    return _step_fused(x, dt, a, b, c, state)
+
+
+def _conv_dispatch(x, conv_state, weight, bias):  # type: ignore[no-untyped-def]
+    if torch.is_grad_enabled() or not x.is_cuda:
+        return _REF_CONV(x, conv_state, weight, bias)
+    return _conv_fused(x, conv_state, weight, bias)
+
+
+def _rel_err(got: Tensor, ref: Tensor) -> float:
+    return (
+        (got.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-12)
+    ).item()
+
+
+def _check_fused_step(device: torch.device) -> None:
+    g = torch.Generator(device="cpu").manual_seed(1)
+    bsz, heads, headdim, d_state = 3, 4, 64, 128
+    rand = lambda *shape: torch.randn(*shape, generator=g).to(device)  # noqa: E731
+    x, b, c = rand(bsz, heads, headdim), rand(bsz, d_state), rand(bsz, d_state)
+    dt = F.softplus(rand(bsz, heads) - 2)
+    a = -torch.rand(heads, generator=g).to(device) * 4
+    state = rand(bsz, heads, headdim, d_state)
+    before = state.clone()
+    with torch.no_grad():
+        ref = _step_fp32(x, dt, a, b, c, state)
+        got = _step_fused(x, dt, a, b, c, state)
+    for name, r, o in zip(("y", "state"), ref, got):
+        err = _rel_err(o, r)
+        if not err < 1e-3:
+            raise RuntimeError(
+                f"fused step disagrees with the reference ({name} rel err {err:.2e})"
+            )
+    if not torch.equal(state, before):
+        raise RuntimeError("fused step modified its input state")
+
+
+def _check_fused_conv(device: torch.device) -> None:
+    g = torch.Generator(device="cpu").manual_seed(2)
+    bsz, channels, width = 3, 96, 4
+    rand = lambda *shape: torch.randn(*shape, generator=g).to(device)  # noqa: E731
+    x, conv_state = rand(bsz, channels), rand(bsz, channels, width - 1)
+    weight, bias = rand(channels, 1, width), rand(channels)
+    before = conv_state.clone()
+    with torch.no_grad():
+        ref = _REF_CONV(x, conv_state, weight, bias)
+        got = _conv_fused(x, conv_state, weight, bias)
+    for name, r, o in zip(("y", "state"), ref, got):
+        err = _rel_err(o, r)
+        if not err < 1e-3:
+            raise RuntimeError(
+                f"fused conv disagrees with the reference ({name} rel err {err:.2e})"
+            )
+    if not torch.equal(conv_state, before):
+        raise RuntimeError("fused conv modified its input state")
+
+
+def install_scan(fused: bool | None, device: torch.device) -> dict[str, str]:
+    """Choose the kernels. Returns which one is in use for each of scan, step and conv.
+
+    ``fused=None`` (the default) uses mamba_ssm's kernels on CUDA when they are
+    installed and pass the startup check: the chunked scan for prompts and
+    answers, and the single-step kernels (``selective_state_update``, and
+    ``causal_conv1d_update`` if causal-conv1d is installed) for inference
+    thoughts and decoding. Training thoughts always use the reference step,
+    because the fused step has no backward pass. ``True`` requires the fused
+    scan; ``False`` never uses fused kernels.
     """
     lm.ssd_step = _step_fp32
     lm.ssd_chunked_scan = _scan_fp32
+    lm.conv_step = _REF_CONV
+    used = {"scan": "reference", "step": "reference", "conv": "reference"}
     if fused is False:
-        return False
+        return used
     if device.type != "cuda":
         if fused:
             raise SystemExit("--fused-scan needs a CUDA GPU")
-        return False
+        return used
     try:
         __import__("mamba_ssm")
     except ImportError as exc:
         if fused:
-            raise SystemExit("--fused-scan needs `pip install mamba-ssm --no-build-isolation`") from exc
-        print("note: mamba_ssm is not installed, using the reference scan "
-              "(pip install mamba-ssm --no-build-isolation for the fused kernel)")
-        return False
+            raise SystemExit(
+                "--fused-scan needs `pip install mamba-ssm --no-build-isolation`"
+            ) from exc
+        print(
+            "note: mamba_ssm is not installed, using the reference kernels "
+            "(uv sync --extra cuda, or pip install mamba-ssm --no-build-isolation)"
+        )
+        return used
     try:
         _check_fused(device)
     except Exception as exc:  # a broken build or kernel must not change results
         if fused:
             raise SystemExit(f"--fused-scan: {exc}") from exc
         print(f"warning: {exc}; using the reference scan")
-        return False
-    lm.ssd_chunked_scan = _scan_fused
-    return True
+    else:
+        lm.ssd_chunked_scan = _scan_fused
+        used["scan"] = "fused"
+    try:
+        _check_fused_step(device)
+    except Exception as exc:
+        print(
+            f"warning: fused single step unavailable ({exc}); using the reference step"
+        )
+    else:
+        lm.ssd_step = _step_dispatch
+        used["step"] = "fused (inference)"
+        print("fused single step matches the reference")
+    try:
+        __import__("causal_conv1d")
+        _check_fused_conv(device)
+    except Exception as exc:
+        print(
+            f"note: fused single-token conv unavailable ({exc}); using the reference conv"
+        )
+    else:
+        lm.conv_step = _conv_dispatch
+        used["conv"] = "fused (inference)"
+        print("fused single-token conv matches the reference")
+    return used
+
+
+def enable_cuda_graphs(bundle: Bundle, device: torch.device, flag: bool | None) -> bool:
+    """CUDA graphs for inference thought and decode steps (default: on for CUDA)."""
+    on = device.type == "cuda" if flag is None else flag
+    if on and device.type != "cuda":
+        raise SystemExit("--cuda-graphs needs a CUDA GPU")
+    if bundle.kind == "mamba":
+        bundle.model.enable_cuda_graphs(on)
+        return on
+    return False
+
+
+def enable_compiled_thoughts(
+    bundle: Bundle, device: torch.device, mode: str, dtype: str
+) -> str:
+    """Compile the training thought step with torch.compile.
+
+    A thought is one token through every layer: dozens of small kernels, so
+    training time is dominated by launches. torch.compile fuses them. Mode
+    ``"on"`` uses inductor's default; ``"cudagraphs"`` also records CUDA graphs
+    over forward and backward (``mode="reduce-overhead"``, experimental). The
+    compiled step is checked against the eager one, forward and backward, before
+    use, and any failure falls back to eager. Only grad-enabled calls use it;
+    inference keeps the eager step (and its CUDA graphs).
+    """
+    if mode == "auto":
+        mode = "on" if device.type == "cuda" else "off"
+    if mode == "off" or bundle.kind != "mamba":
+        return "off"
+    model = bundle.model
+    eager = model._thought_step
+    compiled = torch.compile(
+        eager, mode="reduce-overhead" if mode == "cudagraphs" else None
+    )
+
+    def run(fn):  # type: ignore[no-untyped-def]
+        g = torch.Generator(device="cpu").manual_seed(3)
+        cfg = model.config
+        h = torch.randn(2, cfg.d_model, generator=g).to(device).requires_grad_()
+        cache = lm.MambaCache(
+            [
+                lm.LayerState(
+                    torch.randn(2, cfg.conv_dim, cfg.d_conv - 1, generator=g).to(device),
+                    torch.randn(2, cfg.n_heads, cfg.headdim, cfg.d_state, generator=g).to(device),
+                )
+                for _ in range(cfg.n_layers)
+            ]
+        )
+        for t in lm._tensors(cache):  # as in training, where the cache carries gradients
+            t.requires_grad_()
+        with autocast(device, dtype):
+            h1, c1, logit = fn(h, cache)
+            h2, c2, logit2 = fn(h1, c1)
+        loss = (
+            h2.float().square().mean()
+            + logit2.float().square().mean()
+            + c2.layers[-1].ssm.float().square().mean()
+        )
+        loss.backward()
+        out = (
+            h2.detach().float(),
+            logit2.detach().float(),
+            h.grad.float(),
+            model.thought_projector.proj.weight.grad.float(),
+        )
+        model.zero_grad(set_to_none=True)
+        return out
+
+    try:
+        torch.manual_seed(0)
+        ref = run(eager)
+        if mode == "cudagraphs":
+            torch.compiler.cudagraph_mark_step_begin()
+        torch.manual_seed(0)
+        got = run(compiled)
+        for name, r, o in zip(("h", "halt", "dh", "dW"), ref, got):
+            err = _rel_err(o, r)
+            if not err < 2e-2:
+                raise RuntimeError(
+                    f"compiled thought step disagrees with eager ({name} rel err {err:.2e})"
+                )
+    except Exception as exc:
+        model.zero_grad(set_to_none=True)
+        print(
+            f"warning: compiled thoughts unavailable, using eager ({type(exc).__name__}: {str(exc)[:300]})"
+        )
+        return "off"
+
+    def step(h, cache, ablate=None):  # type: ignore[no-untyped-def]
+        if ablate is None and torch.is_grad_enabled():
+            return compiled(h, cache)
+        return eager(h, cache, ablate)
+
+    model._thought_step = step
+    print(f"compiled thought step matches eager (mode {mode})")
+    return mode
 
 
 # --------------------------------------------------------------------------- #
@@ -1309,7 +1546,7 @@ def train_cmd(args: argparse.Namespace) -> None:
     d = setup_dist(args.device)
     torch.manual_seed(args.seed)
     random.seed(args.seed)
-    fused = install_scan(args.fused_scan, d.device)
+    kernels = install_scan(args.fused_scan, d.device)
     preset = resolve_preset(args)
     out = Path(args.out or f"runs/{args.dataset}-{args.model}-{args.method}")
     if args.hf_upload and d.is_main:
@@ -1348,6 +1585,10 @@ def train_cmd(args: argparse.Namespace) -> None:
     model = bundle.model.to(d.device)
     if args.grad_checkpoint:
         enable_grad_checkpointing(bundle)
+    kernels["thoughts_compiled"] = enable_compiled_thoughts(
+        bundle, d.device, args.compile_thoughts, args.dtype
+    )
+    kernels["cuda_graphs"] = enable_cuda_graphs(bundle, d.device, args.cuda_graphs)
     broadcast_params(model, d)
     params = list(model.parameters())
 
@@ -1388,7 +1629,7 @@ def train_cmd(args: argparse.Namespace) -> None:
         "phases": [asdict(p) for p in phases],
         "params": count_params(model),
         "world_size": d.world,
-        "scan": "fused" if fused else "reference",
+        "kernels": kernels,
         "train_examples": len(train),
         "valid_examples": len(valid),
     }
@@ -1463,6 +1704,8 @@ def train_cmd(args: argparse.Namespace) -> None:
                     bundle,
                     d.device,
                 )
+                if kernels["thoughts_compiled"] == "cudagraphs":
+                    torch.compiler.cudagraph_mark_step_begin()
                 with autocast(d.device, args.dtype):
                     if phase.ponder:
                         out_p = model.ponder_loss(
@@ -1664,9 +1907,10 @@ def eval_modes(ckpt: dict, preset: Preset, kind: str) -> list[tuple[str, dict]]:
 def eval_cmd(args: argparse.Namespace) -> None:
     d = setup_dist(args.device)
     torch.manual_seed(args.seed)
-    fused = install_scan(args.fused_scan, d.device)
+    kernels = install_scan(args.fused_scan, d.device)
     bundle, ckpt = load_checkpoint(args.ckpt, args.chunk_size)
     bundle.model.to(d.device)
+    kernels["cuda_graphs"] = enable_cuda_graphs(bundle, d.device, args.cuda_graphs)
     preset = Preset(**ckpt["preset"])
     dataset = args.dataset or ckpt["dataset"]
     max_new = args.max_new_tokens or preset.max_new_tokens
@@ -1694,7 +1938,7 @@ def eval_cmd(args: argparse.Namespace) -> None:
     common = dict(max_new_tokens=max_new, batch_size=args.batch_size, dtype=args.dtype)
     result: dict[str, Any] = {
         "ckpt": str(args.ckpt),
-        "scan": "fused" if fused else "reference",
+        "kernels": kernels,
         "model": ckpt["model_name"],
         "method": ckpt["method"],
         "phase": ckpt["phase"],
@@ -1821,7 +2065,7 @@ def state_bytes(bundle: Bundle, prompt: Tensor, n: int) -> int:
 
 def bench_cmd(args: argparse.Namespace) -> None:
     device = pick_device(args.device)
-    fused = install_scan(args.fused_scan, device)
+    kernels = install_scan(args.fused_scan, device)
     dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[
         args.dtype
     ]
@@ -1829,6 +2073,7 @@ def bench_cmd(args: argparse.Namespace) -> None:
     for name in args.models:
         bundle = build(name, pretrained=False, chunk_size=args.chunk_size)
         model = bundle.model.to(device=device, dtype=dtype).eval()
+        graphs = enable_cuda_graphs(bundle, device, args.cuda_graphs)
         n_params = count_params(model)
         torch.manual_seed(0)
         prompt = torch.randint(
@@ -1844,7 +2089,11 @@ def bench_cmd(args: argparse.Namespace) -> None:
                 "batch_size": args.batch_size,
                 "dtype": args.dtype,
                 "device": str(device),
-                "scan": "fused" if fused and bundle.kind == "mamba" else "reference",
+                "kernels": (
+                    {**kernels, "cuda_graphs": graphs}
+                    if bundle.kind == "mamba"
+                    else "transformers"
+                ),
             }
             if bundle.kind == "gpt2" and args.prompt_len + n + 1 >= model.max_positions:
                 row["note"] = f"exceeds context ({model.max_positions})"
@@ -2128,8 +2377,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="mamba_ssm's Triton scan for prompts and answers (default: on for CUDA if installed)",
     )
-    g.add_argument("--grad-checkpoint", action=argparse.BooleanOptionalAction, default=True,
-                   help="recompute Mamba layers in the backward pass to save memory")
+    g.add_argument(
+        "--grad-checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="recompute Mamba layers in the backward pass to save memory",
+    )
+    g.add_argument(
+        "--compile-thoughts",
+        choices=("auto", "off", "on", "cudagraphs"),
+        default="auto",
+        help="torch.compile the training thought step; cudagraphs also records CUDA graphs "
+        "over forward and backward (experimental). auto = on for CUDA",
+    )
+    g.add_argument(
+        "--cuda-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="replay inference thought and decode steps as CUDA graphs (default: on for CUDA)",
+    )
     g.add_argument("--max-train-examples", type=int)
     g.add_argument("--max-val-examples", type=int)
     g.add_argument(
@@ -2185,8 +2451,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--dtype", choices=("fp32", "bf16", "fp16"), default=None)
     p.add_argument("--chunk-size", type=int)
-    p.add_argument("--fused-scan", action=argparse.BooleanOptionalAction, default=None,
-                   help="mamba_ssm's Triton scan for prompts and answers (default: on for CUDA if installed)")
+    p.add_argument(
+        "--fused-scan",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="mamba_ssm's Triton scan for prompts and answers (default: on for CUDA if installed)",
+    )
+    p.add_argument(
+        "--cuda-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="replay inference thought and decode steps as CUDA graphs (default: on for CUDA)",
+    )
     p.add_argument("--out")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device")
@@ -2210,8 +2486,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk-size", type=int, default=256)
     p.add_argument("--out", default="runs/bench.json")
     p.add_argument("--device")
-    p.add_argument("--fused-scan", action=argparse.BooleanOptionalAction, default=None,
-                   help="mamba_ssm's Triton scan for prompts and answers (default: on for CUDA if installed)")
+    p.add_argument(
+        "--fused-scan",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="mamba_ssm's Triton scan for prompts and answers (default: on for CUDA if installed)",
+    )
+    p.add_argument(
+        "--cuda-graphs",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="replay inference thought and decode steps as CUDA graphs (default: on for CUDA)",
+    )
     add_wandb_args(p)
     p.set_defaults(fn=bench_cmd)
 
