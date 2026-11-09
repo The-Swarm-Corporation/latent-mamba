@@ -28,10 +28,11 @@ The model lives in a single file, [`latent_mamba/main.py`](latent_mamba/main.py)
 ```bash
 $ git clone https://github.com/The-Swarm-Corporation/latent-mamba
 $ cd latent-mamba
-$ pip install torch
+$ uv sync                  # model only (PyTorch)
+$ uv sync --extra train    # plus the training pipeline
 ```
 
-Requires Python >= 3.10 and PyTorch >= 2.1. The training pipeline also needs `pip install -r requirements.txt`.
+Uses [uv](https://docs.astral.sh/uv/) with a locked environment (`uv.lock`). Requires Python >= 3.10 and PyTorch >= 2.4. Run code with `uv run`, e.g. `uv run latent_mamba/train.py --help`.
 
 ## Usage
 
@@ -135,7 +136,7 @@ Caches are functional (every update returns new tensors), so they can be branche
 ## Test and demo
 
 ```bash
-$ python latent_mamba/main.py
+$ uv run latent_mamba/main.py
 ```
 
 This runs `self_test()`, which checks that the chunked scan matches the exact recurrence, that prefill + cached decoding matches a single full pass, that state size is independent of thought count, that gradients reach both the thought projector and halting head, and that left padding is exact. It then runs `run_demo()`, which trains a tiny model through the full recipe (language CoT, Coconut curriculum, PonderNet halting) on k-hop pointer chasing and reports accuracy and thoughts used per hop count, against fixed-budget, no-thought and zero-ablated baselines.
@@ -157,6 +158,7 @@ The demo is a smoke test of the pipeline, not a benchmark. Real benchmark result
 | Paper | [docs/paper.pdf](docs/paper.pdf) · LaTeX source [docs/latent_mamba.tex](docs/latent_mamba.tex) |
 | Model | [latent_mamba/main.py](latent_mamba/main.py) |
 | Training & evaluation | [latent_mamba/train.py](latent_mamba/train.py) · [scripts/run_pipeline.sh](scripts/run_pipeline.sh) · [Dockerfile](Dockerfile) |
+| Environment | [pyproject.toml](pyproject.toml) · [uv.lock](uv.lock) |
 | Guides | [docs/RUNPOD.md](docs/RUNPOD.md) (GPUs, RunPod) · [docs/architecture.md](docs/architecture.md) (design notes) |
 | Checkpoints | [huggingface.co/kye/latent-mamba](https://huggingface.co/kye/latent-mamba) |
 | Training logs | [wandb.ai/apacai/latent-mamba](https://wandb.ai/apacai/latent-mamba) |
@@ -167,13 +169,13 @@ The demo is a smoke test of the pipeline, not a benchmark. Real benchmark result
 [`latent_mamba/train.py`](latent_mamba/train.py) fine-tunes pretrained Mamba-2 (`state-spaces/mamba2-130m`, `-370m`, ...) on Coconut's GSM8k-Aug, ProsQA and ProntoQA with the full recipe. It compares against the same Mamba with no CoT, with written CoT, and against a Coconut GPT-2 of matched size, then benchmarks memory and latency against thinking budget. Runs log to [Weights & Biases](https://wandb.ai/apacai/latent-mamba) and upload to [kye/latent-mamba](https://huggingface.co/kye/latent-mamba).
 
 ```bash
-$ pip install -r requirements.txt
-$ python latent_mamba/train.py data --dataset gsm8k prosqa
-$ torchrun --nproc_per_node 4 latent_mamba/train.py train --model mamba2-130m --dataset prosqa --method latent --wandb
-$ python latent_mamba/train.py eval --ckpt runs/prosqa-mamba2-130m-latent/ponder.pt
+$ uv sync --extra train
+$ uv run latent_mamba/train.py data --dataset gsm8k prosqa
+$ uv run torchrun --nproc_per_node 4 latent_mamba/train.py train --model mamba2-130m --dataset prosqa --method latent --wandb
+$ uv run latent_mamba/train.py eval --ckpt runs/prosqa-mamba2-130m-latent/ponder.pt
 ```
 
-[`scripts/run_pipeline.sh`](scripts/run_pipeline.sh) runs everything for one model and dataset, and the [`Dockerfile`](Dockerfile) wraps it. See [docs/RUNPOD.md](docs/RUNPOD.md) for GPUs and step-by-step instructions.
+[`scripts/run_pipeline.sh`](scripts/run_pipeline.sh) runs everything for one model and dataset (`uv run --extra train bash scripts/run_pipeline.sh`), and the [`Dockerfile`](Dockerfile) wraps it. See [docs/RUNPOD.md](docs/RUNPOD.md) for GPUs and step-by-step instructions.
 
 ## Results
 

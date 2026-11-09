@@ -1,4 +1,7 @@
 *
 !latent_mamba/
-!requirements.txt
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
 !scripts/

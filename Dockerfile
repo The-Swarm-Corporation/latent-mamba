@@ -21,13 +21,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 
+COPY --from=ghcr.io/astral-sh/uv:0.12.23 /uv /uvx /bin/
+
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
+COPY pyproject.toml uv.lock README.md LICENSE ./
+# Install into the image's Python, reusing its CUDA build of PyTorch.
+RUN uv pip install --system -r pyproject.toml --extra train
 
 ARG INSTALL_MAMBA_SSM=0
 RUN if [ "$INSTALL_MAMBA_SSM" = "1" ]; then \
-        pip install packaging ninja && pip install --no-build-isolation mamba-ssm; \
+        uv pip install --system packaging ninja && uv pip install --system --no-build-isolation mamba-ssm; \
     fi
 
 COPY latent_mamba/ latent_mamba/

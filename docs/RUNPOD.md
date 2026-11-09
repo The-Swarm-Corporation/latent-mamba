@@ -47,7 +47,7 @@ Then open its web terminal or SSH in and run:
 ```bash
 cd /workspace
 git clone https://github.com/The-Swarm-Corporation/latent-mamba && cd latent-mamba
-pip install -r requirements.txt
+pip install uv && uv pip install --system -r pyproject.toml --extra train   # reuses the pod's PyTorch
 export HF_HOME=/workspace/hf-cache WANDB_DIR=/workspace
 
 # smoke test: about 20 minutes, small slices of ProsQA, everything end to end

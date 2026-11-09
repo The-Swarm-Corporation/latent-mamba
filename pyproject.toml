@@ -1,0 +1,33 @@
+[project]
+name = "latent-mamba"
+version = "0.2.0"
+description = "Latent Mamba: adaptive continuous reasoning in constant memory"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Kye Gomez", email = "kye@swarms.world" }]
+requires-python = ">=3.10"
+# The model (latent_mamba/main.py) needs only PyTorch.
+dependencies = ["torch>=2.4"]
+
+[project.optional-dependencies]
+# Training, evaluation and benchmarking pipeline (latent_mamba/train.py).
+# Pinned to the versions the pipeline was tested with.
+train = [
+    "transformers==5.16.1",
+    "huggingface_hub==1.7.2",
+    "wandb==0.19.5",
+    "setuptools",  # provides distutils, which wandb 0.19 imports
+]
+
+[project.urls]
+Repository = "https://github.com/The-Swarm-Corporation/latent-mamba"
+Paper = "https://github.com/The-Swarm-Corporation/latent-mamba/blob/main/docs/paper.pdf"
+Checkpoints = "https://huggingface.co/kye/latent-mamba"
+
+[dependency-groups]
+dev = ["pyflakes>=3.2"]
+
+[tool.uv]
+# The code runs as scripts (`uv run latent_mamba/train.py ...`), so there is
+# nothing to build or install: uv only manages the environment.
+package = false
